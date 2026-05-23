@@ -1,0 +1,10 @@
+기획
+image
+dist
+build
+.claude
+__pycache__
+.venv
+.env
+settings.json
+ScreenShit.spec
