@@ -1,11 +1,17 @@
 """
 설정 로드/저장 모듈
 settings.json을 읽고 씁니다.
+실행 파일(exe) 옆 또는 스크립트 디렉터리에 저장합니다.
 """
 import json
+import sys
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).parent / "settings.json"
+if getattr(sys, "frozen", False):
+    # PyInstaller 빌드: exe 옆에 저장
+    CONFIG_PATH = Path(sys.executable).parent / "settings.json"
+else:
+    CONFIG_PATH = Path(__file__).parent / "settings.json"
 
 DEFAULT_CONFIG = {
     "hotkey": "f8",
@@ -20,7 +26,7 @@ DEFAULT_CONFIG = {
     },
     "tool_sizes": {
         "pen": 3,
-        "highlighter": 12,
+        "highlighter": 9,
     },
 }
 

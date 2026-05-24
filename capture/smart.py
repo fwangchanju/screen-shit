@@ -67,24 +67,9 @@ class SmartCapture:
             fill="",
         )
 
-        # 안내 텍스트 (그림자 + 본문)
-        cx = sw // 2
-        canvas.create_text(
-            cx + 1, 31,
-            text="클릭하여 캡쳐  |  ESC 취소",
-            fill="black",
-            font=("맑은 고딕", 12),
-        )
-        canvas.create_text(
-            cx, 30,
-            text="클릭하여 캡쳐  |  ESC 취소",
-            fill="white",
-            font=("맑은 고딕", 12),
-        )
-
         canvas.bind("<Motion>", self._on_move)
         canvas.bind("<Button-1>", self._on_click)
-        root.bind("<Escape>", lambda e: root.destroy())
+        root.bind("<Escape>", lambda e: self._cancel())
 
         if self.master:
             self.master.wait_window(root)
@@ -120,3 +105,12 @@ class SmartCapture:
             x1, y1, x2, y2 = self.current_region
             self.captured_image = self.screenshot.crop((x1, y1, x2, y2))
         self.root.destroy()
+
+    def _cancel(self) -> None:
+        """캡처를 취소합니다 (20회차 item 4: 모드 전환 지원)."""
+        self.captured_image = None
+        if self.root:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass

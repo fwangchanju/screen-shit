@@ -33,24 +33,25 @@ _tray_icon = None
 # 편집기 창 참조 (캡처목록 버튼용)
 _editor_ref: list = []
 
-# 툴바 창 참조 (캡처 중 숨기기/복원용)
+# 툴바 창 참조
 _toolbar_win_ref: list = []
 
+# 트레이 메뉴 동적 텍스트용 가시성 상태 (18회차: 기본 True — 툴바 기본 표시)
+_toolbar_visible: bool = True
 
-def _hide_toolbar() -> None:
+
+def _set_toolbar_visible(visible: bool) -> None:
+    global _toolbar_visible
+    _toolbar_visible = visible
+
+
+def _lift_toolbar_above_overlay(root: tk.Tk) -> None:
+    """캡처 오버레이 위에 툴바를 표시합니다 (17회차: 캡처 중 툴바 유지)."""
     try:
         win = _toolbar_win_ref[0] if _toolbar_win_ref else None
-        if win:
-            win.withdraw()
-    except Exception:
-        pass
-
-
-def _show_toolbar() -> None:
-    try:
-        win = _toolbar_win_ref[0] if _toolbar_win_ref else None
-        if win:
-            win.deiconify()
+        if win and win.winfo_viewable():
+            win.lift()
+            win.attributes("-topmost", True)
     except Exception:
         pass
 
@@ -61,14 +62,22 @@ def trigger_capture(root: tk.Tk, mode_var: tk.StringVar) -> None:
 
 
 def _do_capture(root: tk.Tk, mode_var: tk.StringVar) -> None:
-    global _capture_in_progress
+    global _capture_in_progress, _editor_hidden_for_capture
     if _capture_in_progress:
         return
     _capture_in_progress = True
 
-    # 툴바 창 숨기기 (root가 아닌 toolbar Toplevel)
-    _hide_toolbar()
-    # 화면 갱신 후 캡처 시작 (창이 사라질 시간 확보)
+    # 편집기 창이 열려있으면 즉시 숨김
+    # alpha=0으로 먼저 투명화 → DWM 페이드 애니메이션 중에도 화면에 안 보임
+    try:
+        ew = _editor_ref[0] if _editor_ref else None
+        if ew is not None and ew.root.winfo_exists() and ew.root.winfo_viewable():
+            ew.root.attributes('-alpha', 0)  # 즉시 투명 (애니메이션 잔상 방지)
+            ew.root.withdraw()
+            root.update_idletasks()
+            _editor_hidden_for_capture = True
+    except Exception:
+        pass
     root.after(150, lambda: _run_capture(root, mode_var))
 
 
@@ -76,6 +85,12 @@ def _run_capture(root: tk.Tk, mode_var: tk.StringVar) -> None:
     global _capture_in_progress
     try:
         mode = mode_var.get() if mode_var else "smart"
+        if not mode:
+            mode = "smart"  # fallback
+
+        # 오버레이 생성 후 100ms 뒤 툴바를 오버레이 위로 lift (17회차)
+        root.after(100, lambda: _lift_toolbar_above_overlay(root))
+
         captured = _capture_by_mode(root, mode)
 
         if captured is not None:
@@ -89,35 +104,89 @@ def _run_capture(root: tk.Tk, mode_var: tk.StringVar) -> None:
         traceback.print_exc()
     finally:
         _capture_in_progress = False
-        _show_toolbar()
+        # 17회차: 캡처 완료 후 모드 선택 초기화
+        try:
+            if mode_var:
+                mode_var.set("")
+        except Exception:
+            pass
+        # 19회차 item 2: 대기 중인 모드 전환 처리
+        global _pending_mode
+        _has_pending = bool(_pending_mode)
+        if _pending_mode:
+            pm = _pending_mode
+            _pending_mode = ""
+            try:
+                mode_var.set(pm)
+                root.after(60, lambda: _do_capture(root, mode_var))
+            except Exception:
+                pass
+
+        # 캡처 완료 후 자동으로 띄운 툴바는 다시 숨김
+        # (pending mode가 있으면 다음 캡처도 진행 중이므로 아직 유지)
+        global _toolbar_auto_shown
+        if _toolbar_auto_shown and not _has_pending:
+            _toolbar_auto_shown = False
+            def _hide_auto_toolbar():
+                tb = _toolbar_win_ref[0] if _toolbar_win_ref else None
+                if tb:
+                    try:
+                        tb.withdraw()
+                    except Exception:
+                        pass
+            root.after(0, _hide_auto_toolbar)
+
+        # 캡처 취소 시 숨겼던 편집기 복원
+        # (성공 시에는 _open_editor 내 deiconify 처리, 취소 시만 여기서 복원)
+        global _editor_hidden_for_capture
+        if _editor_hidden_for_capture and not _has_pending:
+            _editor_hidden_for_capture = False
+            def _restore_editor():
+                try:
+                    ew = _editor_ref[0] if _editor_ref else None
+                    if ew is not None and ew.root.winfo_exists():
+                        ew.root.deiconify()
+                        ew.root.attributes('-alpha', 1)  # alpha 복원
+                        ew.root.lift()
+                except Exception:
+                    pass
+            root.after(0, _restore_editor)
 
 
 def _capture_by_mode(root: tk.Tk, mode: str):
     """모드에 따라 해당 캡처 클래스를 실행하고 이미지를 반환합니다."""
-    if mode == "direct":
-        from capture.direct import DirectCapture
-        return DirectCapture(master=root).start()
-    elif mode == "smart":
-        from capture.smart import SmartCapture
-        return SmartCapture(master=root).start()
-    elif mode == "fixed":
-        from capture.fixed import FixedCapture
-        return FixedCapture(master=root).start()
-    else:
-        from capture.smart import SmartCapture
-        return SmartCapture(master=root).start()
+    global _current_capture_obj
+    cap = None
+    try:
+        if mode == "direct":
+            from capture.direct import DirectCapture
+            cap = DirectCapture(master=root)
+        elif mode == "smart":
+            from capture.smart import SmartCapture
+            cap = SmartCapture(master=root)
+        elif mode == "fixed":
+            from capture.fixed import FixedCapture
+            cap = FixedCapture(master=root)
+        else:
+            from capture.smart import SmartCapture
+            cap = SmartCapture(master=root)
+        _current_capture_obj = cap          # 19회차 item 2: 취소 가능하도록 참조 저장
+        return cap.start()
+    finally:
+        _current_capture_obj = None
 
 
 def _open_editor(root: tk.Tk, image, idx: int) -> None:
-    """편집기 창을 엽니다. 이미 열려있으면 기존 창을 재활용합니다."""
+    """편집기 창을 엽니다. 이미 열려있으면 기존 창을 재활용합니다. idx=-1이면 빈 상태."""
     global _editor_ref
     try:
-        # 기존 편집기가 살아있으면 새 이미지만 로드
+        # 기존 편집기가 살아있으면 재활용
         ew = _editor_ref[0] if _editor_ref else None
         if ew is not None:
             try:
                 if ew.root.winfo_exists():
                     ew.root.deiconify()
+                    ew.root.attributes('-alpha', 1)  # 캡처 전 alpha=0 설정 복원
                     ew.root.lift()
                     ew.load_image(idx)
                     return
@@ -136,11 +205,8 @@ def _open_editor(root: tk.Tk, image, idx: int) -> None:
 
 
 def _show_capture_list(root: tk.Tk) -> None:
-    """캡처목록 버튼: 편집기를 열거나 포커스합니다."""
+    """캡처목록 버튼: 편집기를 열거나 포커스합니다. 빈 상태도 허용합니다."""
     hist = hist_module.get_history()
-    if hist.count() == 0:
-        messagebox.showinfo("캡처목록", "아직 캡처된 이미지가 없습니다.", parent=root)
-        return
     # 기존 편집기가 살아있으면 포커스
     try:
         ew = _editor_ref[0] if _editor_ref else None
@@ -151,12 +217,147 @@ def _show_capture_list(root: tk.Tk) -> None:
             return
     except Exception:
         pass
-    # 새 편집기 열기
-    idx = hist.count() - 1
-    _open_editor(root, hist.get(idx), idx)
+    # 새 편집기 열기 (빈 상태 포함)
+    if hist.count() > 0:
+        idx = hist.count() - 1
+        _open_editor(root, hist.get(idx), idx)
+    else:
+        _open_editor(root, None, -1)
 
 
 _hotkey_handle = None  # keyboard.add_hotkey 반환 핸들
+_mode_hotkey_handles: dict = {}  # {mode: handle}
+_toolbar_toggle_handle = None  # 툴바 표시/숨기기 단축키 핸들
+_toolbar_was_visible = False   # 캡처 전 툴바 표시 여부
+
+# 19회차 item 2: 캡처 중 모드 전환용
+_current_capture_obj = None   # 현재 실행 중인 캡처 인스턴스
+_pending_mode: str = ""       # 전환 대기 중인 모드
+
+# 툴바가 숨김 상태에서 캡처 진입 시 자동으로 표시했는지 여부
+_toolbar_auto_shown: bool = False
+
+# 캡처 진입 시 편집기를 숨겼는지 여부 (취소 시 복원 용도)
+_editor_hidden_for_capture: bool = False
+
+# 중복 실행 방지용 뮤텍스 (GC 방지용 전역 참조 필요)
+_single_instance_mutex = None
+
+
+def _ensure_single_instance() -> bool:
+    """Windows 뮤텍스로 중복 실행을 방지합니다."""
+    global _single_instance_mutex
+    try:
+        _single_instance_mutex = ctypes.windll.kernel32.CreateMutexW(
+            None, False, "SmartCapture_SingleInstance_Mutex_2025")
+        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
+def _register_mode_hotkeys(root: tk.Tk, mode_var: tk.StringVar) -> None:
+    """모드별 단축키를 등록합니다 (config의 mode_hotkeys)."""
+    global _mode_hotkey_handles
+    try:
+        import keyboard
+    except ImportError:
+        return
+
+    for handle in _mode_hotkey_handles.values():
+        try:
+            keyboard.remove_hotkey(handle)
+        except Exception:
+            pass
+    _mode_hotkey_handles.clear()
+
+    cfg = cfg_module.get()
+    mode_hotkeys: dict = cfg.get("mode_hotkeys", {})
+    for mode, hk in mode_hotkeys.items():
+        if not hk or hk == "없음":
+            continue
+        def _make_cb(m=mode):
+            def _cb():
+                global _pending_mode
+                # 19회차 item 10: 숨겨진 상태에서 단축키 진입 시 툴바 표시
+                # 캡처 완료 후 자동으로 다시 숨기기 위해 auto_shown 플래그 기록
+                def _ensure_toolbar():
+                    global _toolbar_auto_shown
+                    tb = _toolbar_win_ref[0] if _toolbar_win_ref else None
+                    if tb:
+                        try:
+                            if not tb.winfo_viewable():
+                                _toolbar_auto_shown = True
+                                tb.deiconify()
+                                tb.lift()
+                        except Exception:
+                            pass
+                root.after(0, _ensure_toolbar)
+                # 19회차 item 2: 캡처 중 다른 모드 단축키 → 현재 캡처 취소 후 전환
+                if _capture_in_progress:
+                    _pending_mode = m
+                    cap = _current_capture_obj
+                    if cap is not None:
+                        root.after(0, lambda c=cap: _try_cancel(c))
+                else:
+                    mode_var.set(m)
+                    root.after(0, lambda: _do_capture(root, mode_var))
+            return _cb
+        try:
+            handle = keyboard.add_hotkey(hk, _make_cb())
+            _mode_hotkey_handles[mode] = handle
+            print(f"[정보] 모드 단축키 등록: {mode}={hk.upper()}")
+        except Exception as exc:
+            print(f"[경고] 모드 단축키 등록 실패 ({mode}={hk}): {exc}", file=sys.stderr)
+
+
+def _try_cancel(cap) -> None:
+    """캡처 인스턴스를 안전하게 취소합니다 (19회차 item 2)."""
+    try:
+        cap._cancel()
+    except Exception:
+        pass
+
+
+def _register_toolbar_toggle_hotkey(root: tk.Tk, toolbar_ref: list) -> None:
+    """툴바 표시/숨기기 단축키를 등록합니다."""
+    global _toolbar_toggle_handle
+    try:
+        import keyboard
+    except ImportError:
+        return
+
+    if _toolbar_toggle_handle is not None:
+        try:
+            keyboard.remove_hotkey(_toolbar_toggle_handle)
+        except Exception:
+            pass
+        _toolbar_toggle_handle = None
+
+    cfg = cfg_module.get()
+    hk = cfg.get("toolbar_toggle_hotkey", "")
+    if not hk or hk == "없음":
+        return
+
+    def _do_toggle():
+        tb = toolbar_ref[0] if toolbar_ref else None
+        if tb is not None:
+            try:
+                if tb.winfo_viewable():
+                    tb.withdraw()
+                    _set_toolbar_visible(False)
+                else:
+                    tb.deiconify()
+                    tb.lift()
+                    _set_toolbar_visible(True)
+            except Exception:
+                pass
+
+    try:
+        _toolbar_toggle_handle = keyboard.add_hotkey(
+            hk, lambda: root.after(0, _do_toggle))
+        print(f"[정보] 툴바 토글 단축키 등록: {hk.upper()}")
+    except Exception as exc:
+        print(f"[경고] 툴바 토글 단축키 등록 실패: {exc}", file=sys.stderr)
 
 
 def _register_hotkey(root: tk.Tk, mode_var: tk.StringVar) -> None:
@@ -193,8 +394,22 @@ def _register_hotkey(root: tk.Tk, mode_var: tk.StringVar) -> None:
 # ------------------------------------------------------------------
 
 def make_tray_icon():
-    """PIL로 트레이 아이콘 이미지를 생성합니다."""
-    from PIL import Image, ImageDraw
+    """트레이 아이콘 이미지를 반환합니다.
+    image/program/icon.png 가 있으면 해당 파일을 사용하고, 없으면 드로잉 폴백."""
+    from pathlib import Path
+    from PIL import Image
+    try:
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            base = Path(sys._MEIPASS)
+        else:
+            base = Path(__file__).resolve().parent
+        icon_path = base / "image" / "program" / "icon.png"
+        if icon_path.exists():
+            return Image.open(icon_path).convert("RGBA").resize((64, 64), Image.LANCZOS)
+    except Exception:
+        pass
+    # 폴백: 드로잉 아이콘
+    from PIL import ImageDraw
     img = Image.new('RGB', (64, 64), color='#0078D4')
     draw = ImageDraw.Draw(img)
     draw.rectangle([8, 8, 56, 56], outline='white', width=3)
@@ -203,7 +418,8 @@ def make_tray_icon():
     return img
 
 
-def _setup_tray(root: tk.Tk, mode_var: tk.StringVar, toolbar_ref: list) -> None:
+def _setup_tray(root: tk.Tk, mode_var: tk.StringVar, toolbar_ref: list,
+                open_settings_fn=None) -> None:
     """pystray 트레이 아이콘을 별도 스레드에서 실행합니다."""
     global _tray_icon
     try:
@@ -211,6 +427,10 @@ def _setup_tray(root: tk.Tk, mode_var: tk.StringVar, toolbar_ref: list) -> None:
     except ImportError:
         print("[경고] pystray 모듈 없음 - 트레이 아이콘 비활성화", file=sys.stderr)
         return
+
+    def show_capture_list(icon, item):
+        """더블클릭 또는 메뉴 선택 시 캡처 목록 편집기를 엽니다."""
+        root.after(0, lambda: _show_capture_list(root))
 
     def toggle_toolbar(icon, item):
         """툴바 표시/숨기기를 메인 스레드에서 실행합니다."""
@@ -220,19 +440,26 @@ def _setup_tray(root: tk.Tk, mode_var: tk.StringVar, toolbar_ref: list) -> None:
                 try:
                     if tb.winfo_viewable():
                         tb.withdraw()
+                        _set_toolbar_visible(False)
                     else:
                         tb.deiconify()
                         tb.lift()
+                        _set_toolbar_visible(True)
                 except Exception:
                     pass
             else:
-                # toolbar_ref가 없을 때 root 창 자체를 토글
                 if root.winfo_viewable():
                     root.withdraw()
+                    _set_toolbar_visible(False)
                 else:
                     root.deiconify()
                     root.lift()
+                    _set_toolbar_visible(True)
         root.after(0, _toggle)
+
+    def open_settings_tray(icon, item):
+        if open_settings_fn:
+            root.after(0, open_settings_fn)
 
     def quit_app(icon, item):
         """앱을 종료합니다."""
@@ -242,22 +469,11 @@ def _setup_tray(root: tk.Tk, mode_var: tk.StringVar, toolbar_ref: list) -> None:
             root.destroy()
         root.after(0, _quit)
 
-    def on_double_click(icon, item):
-        """더블클릭 시 툴바가 숨겨져 있으면 표시합니다."""
-        def _show():
-            tb = toolbar_ref[0] if toolbar_ref else None
-            if tb is not None:
-                try:
-                    if not tb.winfo_viewable():
-                        tb.deiconify()
-                        tb.lift()
-                        tb.focus_force()
-                except Exception:
-                    pass
-        root.after(0, _show)
-
     menu = pystray.Menu(
-        pystray.MenuItem("툴바 표시/숨기기", toggle_toolbar, default=True),
+        # default=True → 더블클릭 동작, visible=False → 우클릭 메뉴에서 제외
+        pystray.MenuItem("캡처목록 열기", show_capture_list, default=True, visible=False),
+        pystray.MenuItem("툴바 보이기/숨기기", toggle_toolbar),
+        pystray.MenuItem("설정", open_settings_tray),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("종료", quit_app),
     )
@@ -267,6 +483,26 @@ def _setup_tray(root: tk.Tk, mode_var: tk.StringVar, toolbar_ref: list) -> None:
     # 별도 스레드에서 트레이 아이콘 실행 (pystray는 자체 이벤트 루프를 가짐)
     t = threading.Thread(target=_tray_icon.run, daemon=True)
     t.start()
+
+
+def _set_window_icon(win) -> None:
+    """image/program/icon.png 를 창 아이콘으로 설정합니다.
+    파일이 없거나 오류 시 무시합니다."""
+    try:
+        from pathlib import Path
+        from PIL import Image, ImageTk
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            base = Path(sys._MEIPASS)
+        else:
+            base = Path(__file__).resolve().parent
+        icon_path = base / "image" / "program" / "icon.png"
+        if icon_path.exists():
+            img = Image.open(icon_path).convert("RGBA")
+            photo = ImageTk.PhotoImage(img)
+            win.iconphoto(True, photo)
+            win._icon_photo = photo  # GC 방지
+    except Exception:
+        pass
 
 
 def _hide_from_taskbar(root: tk.Tk) -> None:
@@ -283,17 +519,27 @@ def _hide_from_taskbar(root: tk.Tk) -> None:
 
 
 def main() -> None:
+    # 중복 실행 방지 (Windows 뮤텍스)
+    if not _ensure_single_instance():
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, "스마트 캡쳐가 이미 실행 중입니다.", "알림", 0x40)
+        except Exception:
+            pass
+        sys.exit(0)
+
     root = tk.Tk()
     root.withdraw()  # 툴바가 표시하기 전까지 숨김
+    _set_window_icon(root)
 
     # 작업표시줄에서 루트 창 숨기기
     _hide_from_taskbar(root)
 
-    # 모드 변수 (toolbar.py에서 업데이트)
-    mode_var = tk.StringVar(value="smart")
+    # 모드 변수 (캡처 시 설정, 완료 후 초기화 — 17회차: 기본값 없음)
+    mode_var = tk.StringVar(value="")
 
-    # 전역 단축키 등록
-    _register_hotkey(root, mode_var)
+    # 모드별 단축키만 등록 (전체 캡처 단축키 없음)
+    _register_mode_hotkeys(root, mode_var)
 
     # toolbar_ref: 트레이 아이콘에서 툴바 창을 참조하기 위한 리스트
     toolbar_ref = []
@@ -307,11 +553,16 @@ def main() -> None:
             cfg["hotkey"] = hk
             _register_hotkey(root, mode_var)
 
+        def on_mode_hotkeys_changed() -> None:
+            _register_mode_hotkeys(root, mode_var)
+            _register_toolbar_toggle_hotkey(root, toolbar_ref)
+
         toolbar = Toolbar(
             root,
             mode_var=mode_var,
             on_capture=trigger_capture,
             on_hotkey_changed=on_hotkey_changed,
+            on_mode_hotkeys_changed=on_mode_hotkeys_changed,
             on_show_list=lambda: _show_capture_list(root),
         )
 
@@ -319,8 +570,17 @@ def main() -> None:
         _toolbar_win_ref.append(toolbar.win)
         toolbar_ref.append(toolbar.win)
 
+        # 18회차 item 2: Map/Unmap 이벤트로 _toolbar_visible 자동 동기화
+        # (X버튼·단축키·트레이 모든 경로에서 동기화)
+        toolbar.win.bind("<Map>",   lambda e: _set_toolbar_visible(True))
+        toolbar.win.bind("<Unmap>", lambda e: _set_toolbar_visible(False))
+
+        # 툴바 토글 단축키 등록
+        _register_toolbar_toggle_hotkey(root, toolbar_ref)
+
         # 트레이 아이콘 설정 (별도 스레드)
-        _setup_tray(root, mode_var, toolbar_ref)
+        _setup_tray(root, mode_var, toolbar_ref,
+                    open_settings_fn=toolbar._open_settings)
 
         toolbar.run()
     except ImportError:

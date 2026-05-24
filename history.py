@@ -72,6 +72,32 @@ class CaptureHistory:
         """현재 저장된 이미지 수를 반환합니다."""
         return len(self._images)
 
+    def insert(self, idx: int, image: Image.Image) -> None:
+        """지정 인덱스에 이미지를 삽입하고 썸네일 캐시를 재조정합니다."""
+        if idx < 0 or idx > len(self._images):
+            raise IndexError(f"삽입 인덱스 범위 초과: {idx}")
+        self._images.insert(idx, image.copy())
+        new_cache: dict[tuple, ImageTk.PhotoImage] = {}
+        for (old_idx, size), tk_img in self._thumb_cache.items():
+            if old_idx < idx:
+                new_cache[(old_idx, size)] = tk_img
+            else:
+                new_cache[(old_idx + 1, size)] = tk_img
+        self._thumb_cache = new_cache
+
+    def remove(self, idx: int) -> None:
+        """인덱스에 해당하는 이미지를 삭제하고 캐시를 재조정합니다."""
+        if idx < 0 or idx >= len(self._images):
+            raise IndexError(f"히스토리 인덱스 범위 초과: {idx}")
+        self._images.pop(idx)
+        new_cache: dict[tuple, ImageTk.PhotoImage] = {}
+        for (old_idx, size), tk_img in self._thumb_cache.items():
+            if old_idx < idx:
+                new_cache[(old_idx, size)] = tk_img
+            elif old_idx > idx:
+                new_cache[(old_idx - 1, size)] = tk_img
+        self._thumb_cache = new_cache
+
     def clear(self) -> None:
         """모든 히스토리와 캐시를 초기화합니다."""
         self._images.clear()

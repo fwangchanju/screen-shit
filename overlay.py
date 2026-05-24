@@ -35,8 +35,19 @@ class CaptureOverlay:
 
     def start(self):
         """오버레이를 시작하고 캡쳐된 이미지를 반환합니다 (취소 시 None)."""
-        self.screenshot = ImageGrab.grab(all_screens=False)
+        # 멀티모니터: 가상 데스크톱 전체 캡처
+        try:
+            vx = ctypes.windll.user32.GetSystemMetrics(76)
+            vy = ctypes.windll.user32.GetSystemMetrics(77)
+            vw = ctypes.windll.user32.GetSystemMetrics(78)
+            vh = ctypes.windll.user32.GetSystemMetrics(79)
+        except Exception:
+            vx, vy, vw, vh = 0, 0, 0, 0
+
+        self.screenshot = ImageGrab.grab(all_screens=True)
         sw, sh = self.screenshot.size
+        if vw <= 0:
+            vw, vh, vx, vy = sw, sh, 0, 0
 
         enhancer = ImageEnhance.Brightness(self.screenshot)
         dimmed = enhancer.enhance(self.DIM_FACTOR)
@@ -51,7 +62,7 @@ class CaptureOverlay:
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.geometry(f"{sw}x{sh}+0+0")
+        root.geometry(f"{vw}x{vh}+{vx}+{vy}")
         root.focus_force()
 
         canvas = tk.Canvas(root, cursor="crosshair", highlightthickness=0, bd=0)

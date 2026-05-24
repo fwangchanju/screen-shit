@@ -46,7 +46,7 @@ def _render_pen(image: Image.Image, data: dict) -> Image.Image:
     color = data["color"]
     width = data.get("width", 3)
     if len(pts) >= 2:
-        draw.line(pts, fill=color, width=width, joint="curve")
+        draw.line(pts, fill=color, width=width)
     elif len(pts) == 1:
         x, y = pts[0]
         r = max(1, width // 2)
@@ -69,7 +69,7 @@ def _render_highlighter(image: Image.Image, data: dict) -> Image.Image:
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     if len(pts) >= 2:
-        draw.line(pts, fill=rgba_color, width=width, joint="curve")
+        draw.line(pts, fill=rgba_color, width=width)
     elif len(pts) == 1:
         x, y = pts[0]
         rad = max(1, width // 2)

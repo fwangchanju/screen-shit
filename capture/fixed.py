@@ -14,7 +14,6 @@ config에서 저장된 크기/위치를 불러와 고정 크기 영역을 캡처
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
 from PIL import Image, ImageTk, ImageGrab, ImageEnhance
 
 import config as cfg_module
@@ -78,21 +77,35 @@ class FixedCapture:
         self._var_x: tk.StringVar | None = None
         self._var_y: tk.StringVar | None = None
         self._var_locked: tk.BooleanVar | None = None
-        self._entry_widgets: list[ttk.Entry] = []
+        self._entry_widgets: list[tk.Entry] = []
         self._syncing: bool = False  # _sync_vars 중 trace 재진입 방지
 
     def start(self) -> Image.Image | None:
         """오버레이를 시작하고 캡처된 이미지를 반환합니다. 취소 시 None."""
+        import ctypes
         self.config = cfg_module.get()
         fc = self.config.get("fixed_capture", {})
         self._rx = int(fc.get("x", 100))
         self._ry = int(fc.get("y", 100))
         self._rw = int(fc.get("width", 400))
         self._rh = int(fc.get("height", 300))
-        self._locked = bool(fc.get("locked", False))
+        self._locked = bool(fc.get("locked", False))  # 19회차 item 1: 마지막 잠금 상태 복원
 
-        self.screenshot = ImageGrab.grab(all_screens=False)
+        # 멀티모니터: 가상 데스크톱 전체 캡처
+        try:
+            vx = ctypes.windll.user32.GetSystemMetrics(76)
+            vy = ctypes.windll.user32.GetSystemMetrics(77)
+            vw = ctypes.windll.user32.GetSystemMetrics(78)
+            vh = ctypes.windll.user32.GetSystemMetrics(79)
+        except Exception:
+            vx, vy, vw, vh = 0, 0, 0, 0
+
+        self.screenshot = ImageGrab.grab(all_screens=True)
         sw, sh = self.screenshot.size
+        if vw <= 0:
+            vw, vh, vx, vy = sw, sh, 0, 0
+        self._vw = vw
+        self._vh = vh
 
         enhancer = ImageEnhance.Brightness(self.screenshot)
         dimmed = enhancer.enhance(_DARKEN_FACTOR)
@@ -105,12 +118,12 @@ class FixedCapture:
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.geometry(f"{sw}x{sh}+0+0")
+        root.geometry(f"{vw}x{vh}+{vx}+{vy}")
         root.focus_force()
 
-        # 캔버스 (화면 전체)
+        # 캔버스 (가상 데스크톱 전체)
         canvas = tk.Canvas(root, cursor="fleur", highlightthickness=0, bd=0,
-                           width=sw, height=sh)
+                           width=vw, height=vh)
         canvas.place(x=0, y=0)
         self.canvas = canvas
 
@@ -139,13 +152,19 @@ class FixedCapture:
         canvas.bind("<B1-Motion>", self._on_drag)
         canvas.bind("<ButtonRelease-1>", self._on_release)
         canvas.bind("<Motion>", self._on_motion)
-        root.bind("<Escape>", lambda e: self._cancel())
-        root.bind("<Return>", lambda e: self._confirm())
-        root.bind("<KP_Enter>", lambda e: self._confirm())
-        root.bind("<Left>",  lambda e: self._nudge(-1, 0))
-        root.bind("<Right>", lambda e: self._nudge(1, 0))
-        root.bind("<Up>",    lambda e: self._nudge(0, -1))
-        root.bind("<Down>",  lambda e: self._nudge(0, 1))
+        root.bind("<Escape>",    lambda e: self._cancel())
+        root.bind("<Return>",    lambda e: self._confirm())
+        root.bind("<KP_Enter>",  lambda e: self._confirm())
+        root.bind("<space>",     lambda e: self._confirm())  # 18회차 item 9
+        root.bind("<Left>",      lambda e: self._nudge(-1, 0))
+        root.bind("<Right>",     lambda e: self._nudge(1, 0))
+        root.bind("<Up>",        lambda e: self._nudge(0, -1))
+        root.bind("<Down>",      lambda e: self._nudge(0, 1))
+        # 17회차 item 7: Shift+방향키로 W/H 조절
+        root.bind("<Shift-Right>", lambda e: self._nudge_field("w", 1))
+        root.bind("<Shift-Left>",  lambda e: self._nudge_field("w", -1))
+        root.bind("<Shift-Down>",  lambda e: self._nudge_field("h", 1))
+        root.bind("<Shift-Up>",    lambda e: self._nudge_field("h", -1))
 
         if self.master:
             self.master.wait_window(root)
@@ -159,8 +178,11 @@ class FixedCapture:
     # ------------------------------------------------------------------
 
     def _build_panel(self, root: tk.Toplevel | tk.Tk, sw: int, sh: int) -> None:
-        panel = tk.Frame(root, bg="#2b2b2b", height=_PANEL_HEIGHT)
-        panel.place(x=0, y=sh - _PANEL_HEIGHT, width=sw, height=_PANEL_HEIGHT)
+        """컨트롤 패널을 박스 좌측에서 시작, 내용 폭으로 생성합니다."""
+        panel = tk.Frame(root, bg="#2b2b2b")
+        # 초기 위치는 _update_display 에서 설정
+        panel.place(x=self._rx, y=0)
+        self._panel = panel
 
         self._var_w = tk.StringVar(value=str(self._rw))
         self._var_h = tk.StringVar(value=str(self._rh))
@@ -168,74 +190,70 @@ class FixedCapture:
         self._var_y = tk.StringVar(value=str(self._ry))
         self._var_locked = tk.BooleanVar(value=self._locked)
 
-        label_style = {"bg": "#2b2b2b", "fg": "#cccccc", "font": ("맑은 고딕", 10)}
-        entry_style = {"width": 6, "font": ("맑은 고딕", 10)}
+        label_style = {"bg": "#2b2b2b", "fg": "#cccccc", "font": ("맑은 고딕", 9)}
+        entry_style = {"width": 5, "font": ("맑은 고딕", 9)}
+        btn_spin_style = {"bg": "#555555", "fg": "white", "font": ("맑은 고딕", 8),
+                          "relief": tk.FLAT, "padx": 2, "pady": 0, "width": 2}
 
-        col = 8
+        inner = tk.Frame(panel, bg="#2b2b2b")
+        inner.pack(padx=6, pady=4)
 
-        # 너비
-        tk.Label(panel, text="너비:", **label_style).place(x=col, y=14)
-        col += 36
-        e_w = tk.Entry(panel, textvariable=self._var_w, **entry_style)
-        e_w.place(x=col, y=12)
-        col += 58
+        self._entry_widgets = []
 
-        # 높이
-        tk.Label(panel, text="높이:", **label_style).place(x=col, y=14)
-        col += 36
-        e_h = tk.Entry(panel, textvariable=self._var_h, **entry_style)
-        e_h.place(x=col, y=12)
-        col += 58
+        # 19회차 item 1: X Y W H 순서로 표기
+        FIELDS = [
+            ("X:", self._var_x, "x"),
+            ("Y:", self._var_y, "y"),
+            ("W:", self._var_w, "w"),
+            ("H:", self._var_h, "h"),
+        ]
 
-        # X
-        tk.Label(panel, text="X:", **label_style).place(x=col, y=14)
-        col += 22
-        e_x = tk.Entry(panel, textvariable=self._var_x, **entry_style)
-        e_x.place(x=col, y=12)
-        col += 58
+        for label_text, var, field_key in FIELDS:
+            grp = tk.Frame(inner, bg="#2b2b2b")
+            grp.pack(side=tk.LEFT, padx=4)
 
-        # Y
-        tk.Label(panel, text="Y:", **label_style).place(x=col, y=14)
-        col += 22
-        e_y = tk.Entry(panel, textvariable=self._var_y, **entry_style)
-        e_y.place(x=col, y=12)
-        col += 66
+            tk.Label(grp, text=label_text, **label_style).pack(side=tk.LEFT)
 
-        self._entry_widgets = [e_w, e_h, e_x, e_y]
+            entry = tk.Entry(grp, textvariable=var, **entry_style,
+                             bg="#3a3a3a", fg="white",
+                             insertbackground="white",
+                             relief=tk.FLAT)
+            entry.pack(side=tk.LEFT, padx=(2, 1))
+            self._entry_widgets.append(entry)
+
+            # ± 버튼 (위/아래)
+            spin_frame = tk.Frame(grp, bg="#2b2b2b")
+            spin_frame.pack(side=tk.LEFT)
+
+            def _make_inc(fk=field_key, d=1):
+                def _inc():
+                    self._nudge_field(fk, d)
+                return _inc
+
+            tk.Button(spin_frame, text="▲", command=_make_inc(field_key, 1),
+                      **btn_spin_style).pack(side=tk.TOP)
+            tk.Button(spin_frame, text="▼", command=_make_inc(field_key, -1),
+                      **btn_spin_style).pack(side=tk.TOP)
 
         # 입력창 변경 시 영역 업데이트
         for var in (self._var_w, self._var_h, self._var_x, self._var_y):
             var.trace_add("write", self._on_entry_change)
 
-        # 저장 버튼
-        btn_save = tk.Button(
-            panel, text="저장", bg="#444444", fg="white",
-            font=("맑은 고딕", 10), relief=tk.FLAT, padx=8,
-            command=self._save_config,
-        )
-        btn_save.place(x=col, y=10)
-        col += 50
-
         # 고정 버튼
         self._btn_lock = tk.Button(
-            panel, text="🔒 고정", bg="#444444", fg="white",
-            font=("맑은 고딕", 10), relief=tk.FLAT, padx=8,
+            inner, text="🔒", bg="#444444", fg="white",
+            font=("맑은 고딕", 10), relief=tk.FLAT, padx=6,
             command=self._toggle_lock,
         )
-        self._btn_lock.place(x=col, y=10)
-        col += 66
+        self._btn_lock.pack(side=tk.LEFT, padx=(6, 2))
 
         # 캡처 버튼
         btn_capture = tk.Button(
-            panel, text="캡처", bg="#0078D4", fg="white",
-            font=("맑은 고딕", 10, "bold"), relief=tk.FLAT, padx=10,
+            inner, text="캡처", bg="#0078D4", fg="white",
+            font=("맑은 고딕", 9, "bold"), relief=tk.FLAT, padx=8,
             command=self._confirm,
         )
-        btn_capture.place(x=col, y=10)
-        col += 58
-
-        # ESC 안내
-        tk.Label(panel, text="ESC 취소", **label_style).place(x=col, y=14)
+        btn_capture.pack(side=tk.LEFT, padx=(2, 0))
 
         # 고정 상태 초기 적용
         self._apply_lock_state()
@@ -403,9 +421,9 @@ class FixedCapture:
         for entry in self._entry_widgets:
             entry.config(state=state)
         if self._locked:
-            self._btn_lock.config(text="🔒 고정됨", bg="#885500")
+            self._btn_lock.config(text="🔒", bg="#885500")
         else:
-            self._btn_lock.config(text="🔒 고정", bg="#444444")
+            self._btn_lock.config(text="🔒", bg="#444444")
 
     def _nudge(self, dx: int, dy: int) -> None:
         """방향키로 선택 영역을 이동합니다."""
@@ -414,6 +432,23 @@ class FixedCapture:
         sw, sh = self.screenshot.size
         self._rx = max(0, min(self._rx + dx, sw - self._rw))
         self._ry = max(0, min(self._ry + dy, sh - self._rh))
+        self._sync_vars()
+        self._update_display()
+
+    def _nudge_field(self, field: str, delta: int) -> None:
+        """패널의 ▲▼ 버튼으로 각 필드를 ±1 조정합니다."""
+        if self._locked:
+            return
+        if field == "w":
+            self._rw = max(10, self._rw + delta)
+        elif field == "h":
+            self._rh = max(10, self._rh + delta)
+        elif field == "x":
+            sw, _ = self.screenshot.size
+            self._rx = max(0, min(self._rx + delta, sw - self._rw))
+        elif field == "y":
+            _, sh = self.screenshot.size
+            self._ry = max(0, min(self._ry + delta, sh - self._rh))
         self._sync_vars()
         self._update_display()
 
@@ -430,6 +465,8 @@ class FixedCapture:
         self.root.destroy()
 
     def _cancel(self) -> None:
+        # 20회차 item 3: ESC 종료 시에도 마지막 크기/위치/잠금 상태 저장
+        self._save_config()
         self.captured_image = None
         self.root.destroy()
 
@@ -472,3 +509,22 @@ class FixedCapture:
         self.canvas.coords(self._bright_item, x1, y1)
         self.canvas.itemconfig(self._bright_item, image=tk_crop)
         self.canvas.coords(self._rect_item, x1, y1, x2, y2)
+
+        # 패널 위치: 박스 좌측에서 시작, 박스 아래 (또는 위)
+        if hasattr(self, '_panel'):
+            vh = getattr(self, '_vh', sh)
+            self._panel.update_idletasks()
+            panel_h = self._panel.winfo_reqheight() or _PANEL_HEIGHT
+            panel_w = self._panel.winfo_reqwidth() or 200
+
+            panel_x = x1  # 박스 좌측 라인에 맞춤
+            panel_y = y2 + 6
+            if panel_y + panel_h > vh:
+                panel_y = max(0, y1 - panel_h - 6)
+
+            # 화면 오른쪽을 벗어나지 않도록
+            sw2, _ = self.screenshot.size
+            if panel_x + panel_w > sw2:
+                panel_x = max(0, sw2 - panel_w)
+
+            self._panel.place(x=panel_x, y=panel_y)

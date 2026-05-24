@@ -84,8 +84,20 @@ class DirectCapture:
 
     def start(self) -> Image.Image | None:
         """오버레이를 시작하고 캡처된 이미지를 반환합니다. 취소 시 None."""
-        self.screenshot = ImageGrab.grab(all_screens=False)
+        import ctypes
+        # 멀티모니터: 가상 데스크톱 전체 캡처
+        try:
+            vx = ctypes.windll.user32.GetSystemMetrics(76)
+            vy = ctypes.windll.user32.GetSystemMetrics(77)
+            vw = ctypes.windll.user32.GetSystemMetrics(78)
+            vh = ctypes.windll.user32.GetSystemMetrics(79)
+        except Exception:
+            vx, vy, vw, vh = 0, 0, 0, 0
+
+        self.screenshot = ImageGrab.grab(all_screens=True)
         sw, sh = self.screenshot.size
+        if vw <= 0:
+            vw, vh, vx, vy = sw, sh, 0, 0
 
         enhancer = ImageEnhance.Brightness(self.screenshot)
         dimmed = enhancer.enhance(_DARKEN_FACTOR)
@@ -98,7 +110,7 @@ class DirectCapture:
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.geometry(f"{sw}x{sh}+0+0")
+        root.geometry(f"{vw}x{vh}+{vx}+{vy}")
         root.focus_force()
 
         canvas = tk.Canvas(root, cursor="crosshair", highlightthickness=0, bd=0)
@@ -129,17 +141,19 @@ class DirectCapture:
             anchor=tk.NW, state=tk.HIDDEN,
         )
 
-        # 힌트 텍스트
+        # 힌트 텍스트 (기본 숨김, 16회차 item 7)
         cx = sw // 2
         self._hint_shadow_item = canvas.create_text(
             cx + 1, 31,
             text="드래그하여 영역 선택  |  ESC 취소",
             fill="black", font=_HINT_FONT,
+            state=tk.HIDDEN,
         )
         self._hint_item = canvas.create_text(
             cx, 30,
             text="드래그하여 영역 선택  |  ESC 취소",
             fill="white", font=_HINT_FONT,
+            state=tk.HIDDEN,
         )
 
         # 돋보기 테두리 + 이미지
@@ -327,8 +341,8 @@ class DirectCapture:
 
         self._update_selection()
         self._hide_magnifier()
-        # 방향키 조정 힌트 표시
-        self._show_adjust_hint()
+        # 간편캡처: 드래그 완료 즉시 확정 → 편집기 진입
+        self._confirm()
 
     # ------------------------------------------------------------------
     # 핸들 상호작용 (drag_done 상태)
@@ -508,13 +522,12 @@ class DirectCapture:
         tk_mag = ImageTk.PhotoImage(magnified)
         self._magnifier_tk = tk_mag  # GC 방지
 
-        # 돋보기 위치 (커서 오른쪽 아래, 화면 경계 고려)
-        bx = mx + _MAGNIFIER_OFFSET
-        by = my + _MAGNIFIER_OFFSET
-        if bx + _MAGNIFIER_SIZE > sw:
-            bx = mx - _MAGNIFIER_OFFSET - _MAGNIFIER_SIZE
-        if by + _MAGNIFIER_SIZE > sh:
-            by = my - _MAGNIFIER_OFFSET - _MAGNIFIER_SIZE
+        # 19회차 item 11: 돋보기 중심을 커서 위치에 맞춤
+        bx = mx - _MAGNIFIER_SIZE // 2
+        by = my - _MAGNIFIER_SIZE // 2
+        # 화면 경계 클리핑
+        bx = max(0, min(bx, sw - _MAGNIFIER_SIZE))
+        by = max(0, min(by, sh - _MAGNIFIER_SIZE))
 
         self.canvas.coords(self._magnifier_border, bx - 2, by - 2,
                            bx + _MAGNIFIER_SIZE + 2, by + _MAGNIFIER_SIZE + 2)
