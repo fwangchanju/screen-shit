@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - 'release/v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from branch name
+        id: version
+        shell: bash
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          VERSION="${BRANCH#release/}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate icon.ico
+        run: python -c "from PIL import Image; img=Image.open('image/program/icon.png').convert('RGBA').resize((256,256),Image.LANCZOS); img.save('image/program/icon.ico', format='ICO', sizes=[(256,256)])"
+
+      - name: Build with PyInstaller
+        run: pyinstaller ScreenShit.spec --clean --noconfirm
+
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ScreenShit ${{ steps.version.outputs.version }}
+          files: dist/ScreenShit.exe
