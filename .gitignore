@@ -1,5 +1,4 @@
-기획
-image
+docs
 dist
 build
 .claude
@@ -7,4 +6,7 @@ __pycache__
 .venv
 .env
 settings.json
-ScreenShit.spec
+
+# 빌드 시 자동 생성 (build.bat에서 icon.png → icon.ico 변환)
+image/program/icon.ico
+image/example/*

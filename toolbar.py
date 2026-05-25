@@ -55,8 +55,8 @@ def _set_autorun(enable: bool) -> None:
             except FileNotFoundError:
                 pass
         winreg.CloseKey(k)
-    except Exception as e:
-        print(f"[경고] 자동실행 설정 실패: {e}")
+    except Exception:
+        pass
 
 
 TOOLBAR_BG    = "#F3F3F3"
@@ -209,6 +209,8 @@ class Toolbar:
         self._settings_win: Optional[tk.Toplevel] = None
 
         self._tooltip = _Tooltip(root)
+        self._interactive: bool = True      # 캡처 중 비활성화용
+        self._all_btn_frames: list = []     # set_interactive 에서 커서 일괄 변경용
 
         # 18회차 item 6: image/툴바.png 아이콘 로드
         self._icon_photos: list = []  # GC 방지용 참조 저장
@@ -265,8 +267,8 @@ class Toolbar:
     # ──────────────────────────────────────────────
 
     def _build(self) -> None:
-        outer = tk.Frame(self.win, bg=BORDER_COLOR, bd=1, relief=tk.RIDGE)
-        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        outer = tk.Frame(self.win, bg=TOOLBAR_BG)
+        outer.pack(fill=tk.BOTH, expand=True)
 
         body = tk.Frame(outer, bg=TOOLBAR_BG, padx=4, pady=4)
         body.pack(fill=tk.BOTH, expand=True)
@@ -354,6 +356,8 @@ class Toolbar:
                 w.config(bg=bg)
 
         def on_enter(e):
+            if not self._interactive:
+                return
             if not getattr(frame, '_active', False):
                 _set_bg(BTN_HOVER_BG)
 
@@ -362,9 +366,13 @@ class Toolbar:
                 _set_bg(BTN_BG)
 
         def on_press(e):
+            if not self._interactive:
+                return
             _set_bg(BTN_ACTIVE_BG)
 
         def on_release(e):
+            if not self._interactive:
+                return
             command()
 
         for w in all_w:
@@ -378,6 +386,7 @@ class Toolbar:
             self._tooltip.bind(lbl_icon, tooltip_fn)
 
         frame._active = False
+        self._all_btn_frames.append(frame)
         return frame
 
     # ──────────────────────────────────────────────
@@ -393,7 +402,7 @@ class Toolbar:
             ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)
             screen_w = wa.right - wa.left
             x = wa.left + (screen_w - w) // 2
-            y = wa.top + 4
+            y = wa.top + 20
         except Exception:
             sw = self.win.winfo_screenwidth()
             x = (sw - w) // 2
@@ -470,7 +479,7 @@ class Toolbar:
                 pass
 
         win = tk.Toplevel(self._root)
-        win.title("환경설정")
+        win.title("설정")
         win.resizable(False, False)
         self._settings_win = win
 
@@ -529,27 +538,60 @@ class Toolbar:
         tk.Label(f_hotkey, text="단축키 설정", font=("맑은 고딕", 11, "bold"),
                  anchor=tk.W).pack(fill=tk.X, pady=(0, 8))
 
+        # 현재 대기 중인 행의 취소 함수 + 소속 위젯 (동시에 하나만 활성)
+        _active_cancel:  list = [None]
+        _active_widgets: list = [set()]
+
+        # 창 내부 아무 곳이나 클릭 시 — 활성 박스 외부면 취소
+        def _on_win_click(event):
+            if _active_cancel[0] and event.widget not in _active_widgets[0]:
+                _active_cancel[0]()
+        win.bind_all("<Button-1>", _on_win_click, add="+")
+
+        PLACEHOLDER_FG = "#AAAAAA"
+
         def _make_hk_row(parent, label_text: str, store: list) -> None:
-            """인라인 단축키 입력 행 (17회차: 팝업 없이)."""
+            """단축키 입력 행 — 박스 클릭으로 활성화, 박스 외부 클릭으로 해제."""
             row = tk.Frame(parent)
             row.pack(fill=tk.X, pady=4)
             tk.Label(row, text=label_text, font=("맑은 고딕", 10),
                      width=16, anchor=tk.W).pack(side=tk.LEFT)
-            disp = tk.Label(row, text=self._hk_display(store[0]),
-                            font=("맑은 고딕", 10, "bold"), fg=ACCENT_COLOR,
-                            width=12, anchor=tk.W)
-            disp.pack(side=tk.LEFT, padx=4)
 
-            btn_set = tk.Button(row, text="설정", font=("맑은 고딕", 9))
-            btn_set.pack(side=tk.LEFT)
+            # 입력 박스: 기본 상태에서 현재 단축키를 플레이스홀더(회색)로 표시
+            box = tk.Frame(row, relief=tk.SUNKEN, bd=1, bg="white",
+                           cursor="hand2", padx=6, pady=2)
+            box.pack(side=tk.LEFT, padx=4)
+            disp = tk.Label(box, text=self._hk_display(store[0]),
+                            font=("맑은 고딕", 10), fg=PLACEHOLDER_FG,
+                            bg="white", width=12, anchor=tk.W)
+            disp.pack()
+
             _waiting = [False]
 
+            def _cancel():
+                if _waiting[0]:
+                    disp.config(text=self._hk_display(store[0]),
+                                fg=PLACEHOLDER_FG, bg="white")
+                    box.config(bg="white")
+                    _waiting[0] = False
+                    try:
+                        win.unbind("<KeyPress>")
+                    except Exception:
+                        pass
+                _active_cancel[0] = None
+                _active_widgets[0] = set()
+
             def _start():
+                # 다른 행이 대기 중이면 먼저 취소
+                if _active_cancel[0] is not None and _active_cancel[0] is not _cancel:
+                    _active_cancel[0]()
                 if _waiting[0]:
                     return
                 _waiting[0] = True
-                disp.config(text="▌ 입력 대기...", fg="#E87C00")
-                btn_set.config(state=tk.DISABLED)
+                _active_cancel[0] = _cancel
+                _active_widgets[0] = {box, disp}
+                disp.config(text="단축키 입력", fg="#E87C00", bg="#FFF8E8")
+                box.config(bg="#FFF8E8")
                 win.focus_force()
 
                 def _on_key(event):
@@ -560,25 +602,27 @@ class Toolbar:
                     sym = event.keysym.lower()
                     if sym == "escape":
                         store[0] = "없음"
-                        disp.config(text="없음", fg=ACCENT_COLOR)
-                        btn_set.config(state=tk.NORMAL)
-                        _waiting[0] = False
-                        win.unbind("<KeyPress>")
+                        _cancel()
                         return "break"
                     if sym in ("control_l", "control_r", "alt_l", "alt_r",
                                "shift_l", "shift_r", "meta_l", "meta_r"):
                         return
                     hk = "+".join(mods + [sym])
                     store[0] = hk
-                    disp.config(text=self._hk_display(hk), fg=ACCENT_COLOR)
-                    btn_set.config(state=tk.NORMAL)
+                    disp.config(text=self._hk_display(hk),
+                                fg=PLACEHOLDER_FG, bg="white")
+                    box.config(bg="white")
                     _waiting[0] = False
+                    _active_cancel[0] = None
+                    _active_widgets[0] = set()
                     win.unbind("<KeyPress>")
                     return "break"
 
                 win.bind("<KeyPress>", _on_key)
 
-            btn_set.config(command=_start)
+            # 클릭으로 활성화 (일반 입력 박스처럼)
+            for w in (box, disp):
+                w.bind("<Button-1>", lambda e: _start())
 
         ttk.Separator(f_hotkey, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 4))
         tk.Label(f_hotkey, text="모드별 단축키", font=("맑은 고딕", 10, "bold"),
@@ -798,6 +842,23 @@ class Toolbar:
     # ──────────────────────────────────────────────
     # 퍼블릭 인터페이스
     # ──────────────────────────────────────────────
+
+    def set_interactive(self, enabled: bool) -> None:
+        """캡처 중 툴바를 비주얼 전용으로 전환합니다.
+        enabled=False: 호버·클릭 효과 없음, 커서 arrow.
+        enabled=True: 정상 동작 복원."""
+        self._interactive = enabled
+        cursor = "hand2" if enabled else "arrow"
+        for frame in self._all_btn_frames:
+            try:
+                frame.config(cursor=cursor)
+                for child in frame.winfo_children():
+                    try:
+                        child.config(cursor=cursor)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     def run(self) -> None:
         self._root.mainloop()

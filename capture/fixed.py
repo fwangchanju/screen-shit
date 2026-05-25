@@ -40,8 +40,9 @@ _CURSOR_MAP = {
 
 
 class FixedCapture:
-    def __init__(self, master=None):
+    def __init__(self, master=None, on_overlay_ready=None):
         self.master = master
+        self._on_overlay_ready = on_overlay_ready
         self.screenshot: Image.Image | None = None
         self.dimmed_tk: ImageTk.PhotoImage | None = None
         self.captured_image: Image.Image | None = None
@@ -147,6 +148,10 @@ class FixedCapture:
         # 초기 선택 영역 렌더링
         self._update_display()
 
+        # 오버레이 생성 완료 → 50ms 후 콜백 (툴바를 오버레이 위로 lift)
+        if self._on_overlay_ready:
+            root.after(50, self._on_overlay_ready)
+
         # 이벤트 바인딩
         canvas.bind("<ButtonPress-1>", self._on_press)
         canvas.bind("<B1-Motion>", self._on_drag)
@@ -165,6 +170,15 @@ class FixedCapture:
         root.bind("<Shift-Left>",  lambda e: self._nudge_field("w", -1))
         root.bind("<Shift-Down>",  lambda e: self._nudge_field("h", 1))
         root.bind("<Shift-Up>",    lambda e: self._nudge_field("h", -1))
+
+        # 3-2 item 7: keyboard 레벨 ESC 훅 (포커스 미확보 시 보완)
+        self._kb_esc_hook = None
+        try:
+            import keyboard as _kb
+            self._kb_esc_hook = _kb.add_hotkey(
+                'esc', lambda: root.after(0, self._cancel), suppress=False)
+        except Exception:
+            pass
 
         if self.master:
             self.master.wait_window(root)
@@ -460,12 +474,23 @@ class FixedCapture:
         y2 = max(0, min(self._ry + self._rh, sh))
         if x2 > x1 and y2 > y1:
             self.captured_image = self.screenshot.crop((x1, y1, x2, y2))
-        # 확정 시 현재 크기/위치 자동 저장
+        self._remove_kb_hook()
         self._save_config()
         self.root.destroy()
 
+    def _remove_kb_hook(self) -> None:
+        """keyboard ESC 훅을 안전하게 제거합니다."""
+        h = getattr(self, '_kb_esc_hook', None)
+        if h is not None:
+            try:
+                import keyboard as _kb
+                _kb.remove_hotkey(h)
+            except Exception:
+                pass
+            self._kb_esc_hook = None
+
     def _cancel(self) -> None:
-        # 20회차 item 3: ESC 종료 시에도 마지막 크기/위치/잠금 상태 저장
+        self._remove_kb_hook()
         self._save_config()
         self.captured_image = None
         self.root.destroy()

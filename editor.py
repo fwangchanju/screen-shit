@@ -26,7 +26,7 @@ def copy_image_to_clipboard(image: Image.Image):
         win32clipboard.CloseClipboard()
         return True
     except Exception as e:
-        print(f"클립보드 복사 실패: {e}")
+        pass
         return False
 
 

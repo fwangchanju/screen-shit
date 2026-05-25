@@ -20,7 +20,6 @@ _DARKEN_FACTOR = 0.45
 _OUTLINE_COLOR = "#0078D4"
 _OUTLINE_WIDTH = 2
 _SIZE_LABEL_FONT = ("맑은 고딕", 11, "bold")
-_HINT_FONT = ("맑은 고딕", 11)
 
 # 돋보기 설정
 _MAGNIFIER_SIZE = 150   # 돋보기 박스 크기 (픽셀)
@@ -42,8 +41,10 @@ _CURSOR_MAP = {
 
 
 class DirectCapture:
-    def __init__(self, master=None):
+    def __init__(self, master=None, on_drag_start=None, on_overlay_ready=None):
         self.master = master
+        self._on_drag_start = on_drag_start
+        self._on_overlay_ready = on_overlay_ready
         self.screenshot: Image.Image | None = None
         self.dimmed_tk: ImageTk.PhotoImage | None = None
         self.captured_image: Image.Image | None = None
@@ -73,8 +74,6 @@ class DirectCapture:
         self._rect_item: int | None = None
         self._size_label_item: int | None = None
         self._size_shadow_item: int | None = None
-        self._hint_item: int | None = None
-        self._hint_shadow_item: int | None = None
         self._magnifier_item: int | None = None
         self._magnifier_border: int | None = None
 
@@ -141,21 +140,6 @@ class DirectCapture:
             anchor=tk.NW, state=tk.HIDDEN,
         )
 
-        # 힌트 텍스트 (기본 숨김, 16회차 item 7)
-        cx = sw // 2
-        self._hint_shadow_item = canvas.create_text(
-            cx + 1, 31,
-            text="드래그하여 영역 선택  |  ESC 취소",
-            fill="black", font=_HINT_FONT,
-            state=tk.HIDDEN,
-        )
-        self._hint_item = canvas.create_text(
-            cx, 30,
-            text="드래그하여 영역 선택  |  ESC 취소",
-            fill="white", font=_HINT_FONT,
-            state=tk.HIDDEN,
-        )
-
         # 돋보기 테두리 + 이미지
         self._magnifier_border = canvas.create_rectangle(
             0, 0, 0, 0,
@@ -165,6 +149,10 @@ class DirectCapture:
             state=tk.HIDDEN,
         )
         self._magnifier_item = canvas.create_image(0, 0, anchor=tk.NW, state=tk.HIDDEN)
+
+        # 오버레이 생성 완료 → 50ms 후 콜백 (툴바를 오버레이 위로 lift)
+        if self._on_overlay_ready:
+            root.after(50, self._on_overlay_ready)
 
         # 이벤트 바인딩
         canvas.bind("<ButtonPress-1>", self._on_press)
@@ -178,6 +166,15 @@ class DirectCapture:
         root.bind("<Right>", lambda e: self._nudge(1, 0))
         root.bind("<Up>", lambda e: self._nudge(0, -1))
         root.bind("<Down>", lambda e: self._nudge(0, 1))
+
+        # 3-2 item 7: keyboard 라이브러리 레벨 ESC 훅 (포커스 문제 보완)
+        self._kb_esc_hook = None
+        try:
+            import keyboard as _kb
+            self._kb_esc_hook = _kb.add_hotkey(
+                'esc', lambda: root.after(0, self._cancel), suppress=False)
+        except Exception:
+            pass
 
         if self.master:
             self.master.wait_window(root)
@@ -246,10 +243,16 @@ class DirectCapture:
 
     def _on_press(self, event: tk.Event) -> None:
         """마우스 버튼 누름 이벤트."""
+        # 3-2 item 2: 드래그 시작 시 툴바 숨기기
+        if self._on_drag_start and not self._drag_done:
+            try:
+                self._on_drag_start()
+            except Exception:
+                pass
+
         if self._drag_done:
             zone = self._hit_test(event.x, event.y)
             if zone == 'none':
-                # 선택 영역 밖: 새 선택 시작
                 self._drag_done = False
                 self._drag_start = (event.x, event.y)
                 self._drag_end = (event.x, event.y)
@@ -257,9 +260,7 @@ class DirectCapture:
                 self._slow_accum = (0.0, 0.0)
                 self._last_raw = (event.x, event.y)
                 self._interact_zone = None
-                self._hide_hint()
             else:
-                # 내부/가장자리: 조작 시작
                 self._interact_zone = zone
                 self._interact_start_mouse = (event.x, event.y)
                 self._interact_start_rect = self._get_rect()
@@ -276,7 +277,6 @@ class DirectCapture:
         self._slow_accum = (0.0, 0.0)
         self._last_raw = (event.x, event.y)
         self._interact_zone = None
-        self._hide_hint()
 
     def _on_drag(self, event: tk.Event) -> None:
         """마우스 드래그 이벤트."""
@@ -336,7 +336,6 @@ class DirectCapture:
             self._drag_start = None
             self._drag_end = None
             self._clear_selection()
-            self._show_hint()
             return
 
         self._update_selection()
@@ -420,7 +419,18 @@ class DirectCapture:
     # 확정 / 취소
     # ------------------------------------------------------------------
 
+    def _remove_kb_hook(self) -> None:
+        """keyboard ESC 훅을 안전하게 제거합니다."""
+        if self._kb_esc_hook is not None:
+            try:
+                import keyboard as _kb
+                _kb.remove_hotkey(self._kb_esc_hook)
+            except Exception:
+                pass
+            self._kb_esc_hook = None
+
     def _confirm(self) -> None:
+        self._remove_kb_hook()
         if self._drag_done and self._drag_start and self._drag_end:
             x1, y1, x2, y2 = self._get_rect()
             sw, sh = self.screenshot.size
@@ -433,6 +443,7 @@ class DirectCapture:
         self.root.destroy()
 
     def _cancel(self) -> None:
+        self._remove_kb_hook()
         self.captured_image = None
         self.root.destroy()
 
@@ -539,21 +550,3 @@ class DirectCapture:
         self.canvas.itemconfig(self._magnifier_item, state=tk.HIDDEN)
         self.canvas.itemconfig(self._magnifier_border, state=tk.HIDDEN)
 
-    def _hide_hint(self) -> None:
-        self.canvas.itemconfig(self._hint_item, state=tk.HIDDEN)
-        self.canvas.itemconfig(self._hint_shadow_item, state=tk.HIDDEN)
-
-    def _show_hint(self) -> None:
-        self.canvas.itemconfig(self._hint_item, state=tk.NORMAL)
-        self.canvas.itemconfig(self._hint_shadow_item, state=tk.NORMAL)
-
-    def _show_adjust_hint(self) -> None:
-        sw, _ = self.screenshot.size
-        hint_text = "Enter 확정  /  ESC 취소"
-        cx = sw // 2
-        self.canvas.itemconfig(self._hint_shadow_item,
-                               text=hint_text, state=tk.NORMAL)
-        self.canvas.itemconfig(self._hint_item,
-                               text=hint_text, state=tk.NORMAL)
-        self.canvas.coords(self._hint_shadow_item, cx + 1, 31)
-        self.canvas.coords(self._hint_item, cx, 30)

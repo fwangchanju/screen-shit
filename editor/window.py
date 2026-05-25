@@ -58,8 +58,10 @@ ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
 # ──────────────────────────────────────────────────────────────
 
 def _set_window_icon(win: "tk.Wm") -> None:
-    """image/program/icon.png 를 창 아이콘으로 설정합니다.
-    파일이 없거나 오류 시 무시합니다."""
+    """창 아이콘을 설정합니다.
+    icon.ico 가 있으면 iconbitmap 으로 적용.
+    없으면 icon.png 를 원본 크기 그대로 iconphoto 로 적용합니다.
+    (icon.png 를 고해상도로 교체하면 자동으로 품질 향상)"""
     try:
         import sys
         from pathlib import Path
@@ -67,14 +69,61 @@ def _set_window_icon(win: "tk.Wm") -> None:
             base = Path(sys._MEIPASS)
         else:
             base = Path(__file__).resolve().parent.parent
-        icon_path = base / "image" / "program" / "icon.png"
-        if icon_path.exists():
-            img = Image.open(icon_path).convert("RGBA")
+        prog_dir = base / "image" / "program"
+        ico_path = prog_dir / "icon.ico"
+        png_path = prog_dir / "icon.png"
+
+        # .ico 파일이 있으면 우선 사용 (사용자가 직접 준비한 경우)
+        if ico_path.exists():
+            win.iconbitmap(str(ico_path))
+            return
+
+        # PNG 를 원본 크기 그대로 사용 (다운스케일 없음)
+        if png_path.exists():
             from PIL import ImageTk
+            img = Image.open(png_path).convert("RGBA")
             photo = ImageTk.PhotoImage(img)
             win.iconphoto(True, photo)
-            # GC 방지: 창 객체에 참조 보관
             win._icon_photo = photo  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _sync_ime_font(hwnd: int, face: str, pt: int) -> None:
+    """Windows IME 조합 창의 폰트를 위젯 폰트와 일치시킵니다.
+    한글 입력 시 조합 중 문자가 다른 스타일로 보이는 문제를 방지합니다."""
+    try:
+        import ctypes
+
+        class _LOGFONTW(ctypes.Structure):
+            _fields_ = [
+                ("lfHeight",         ctypes.c_long),
+                ("lfWidth",          ctypes.c_long),
+                ("lfEscapement",     ctypes.c_long),
+                ("lfOrientation",    ctypes.c_long),
+                ("lfWeight",         ctypes.c_long),
+                ("lfItalic",         ctypes.c_byte),
+                ("lfUnderline",      ctypes.c_byte),
+                ("lfStrikeOut",      ctypes.c_byte),
+                ("lfCharSet",        ctypes.c_byte),
+                ("lfOutPrecision",   ctypes.c_byte),
+                ("lfClipPrecision",  ctypes.c_byte),
+                ("lfQuality",        ctypes.c_byte),
+                ("lfPitchAndFamily", ctypes.c_byte),
+                ("lfFaceName",       ctypes.c_wchar * 32),
+            ]
+
+        imm32 = ctypes.windll.imm32
+        himc = imm32.ImmGetContext(hwnd)
+        if not himc:
+            return
+        lf = _LOGFONTW()
+        lf.lfHeight = -(pt * 96 // 72)  # 포인트 → 96DPI 픽셀 변환
+        lf.lfWeight = 400               # FW_NORMAL
+        lf.lfCharSet = 129              # HANGEUL_CHARSET
+        lf.lfFaceName = face[:31]
+        imm32.ImmSetCompositionFontW(himc, ctypes.byref(lf))
+        imm32.ImmReleaseContext(hwnd, himc)
     except Exception:
         pass
 
@@ -93,7 +142,7 @@ def copy_to_clipboard(image: Image.Image) -> bool:
         win32clipboard.CloseClipboard()
         return True
     except Exception as e:
-        print(f"클립보드 복사 실패: {e}")
+        pass  # 클립보드 복사 실패 시 조용히 무시
         return False
 
 
@@ -215,6 +264,11 @@ class EditorWindow:
         # 19회차 item 7: 도구 크기/색상 인디케이터 (canvas oval)
         self._tool_cursor_item: Optional[int] = None
 
+        # 테두리 패널 상태
+        self._border_panel: Optional[tk.Frame] = None
+        self._border_panel_id: Optional[int] = None
+        self._border_panel_shown: bool = False  # 패널 표시 중일 때만 미리보기 렌더링
+
         # 이미지별 편집 저장소 / 되돌리기 스택
         self._ops_store: dict = {}
         self._reset_stack: list = []
@@ -236,7 +290,7 @@ class EditorWindow:
         else:
             self.root = tk.Tk()
 
-        self.root.title("스마트 캡쳐 - 편집기")
+        self.root.title("ScreenShit - 편집기")
         self.root.resizable(True, True)
         _set_window_icon(self.root)
 
@@ -252,12 +306,13 @@ class EditorWindow:
         self._build_toolbar()
         self._build_prop_bar()
 
-        # PanedWindow으로 패널 너비 드래그 조절 가능
-        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
+        # 좌우 분할 (사이드바 너비 고정 — PanedWindow 대신 고정 레이아웃)
+        content_area = tk.Frame(self.root)
+        content_area.pack(fill=tk.BOTH, expand=True)
 
-        panel_host = tk.Frame(paned, bg="#2D2D2D")
-        paned.add(panel_host, weight=0)
+        panel_host = tk.Frame(content_area, width=244, bg="#2D2D2D")
+        panel_host.pack(side=tk.LEFT, fill=tk.Y)
+        panel_host.pack_propagate(False)
 
         self._history_panel = HistoryPanel(
             parent_frame=panel_host,
@@ -268,8 +323,8 @@ class EditorWindow:
             on_delete_callback=self._delete_image_at,
         )
 
-        canvas_area = tk.Frame(paned)
-        paned.add(canvas_area, weight=1)
+        canvas_area = tk.Frame(content_area)
+        canvas_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._build_canvas(canvas_area)
         self._build_statusbar(canvas_area)
@@ -277,11 +332,11 @@ class EditorWindow:
         self._bind_keys()
 
     def _build_toolbar(self) -> None:
-        """상단 툴바를 구성합니다."""
-        # _width_var은 prop_bar에서도 사용하므로 먼저 초기화
+        """상단 툴바를 구성합니다.
+        순서: 뒤로 앞으로 초기화 | 직선 화살표 원 사각형 |
+              펜 형광펜 텍스트 자르기 모자이크 테두리 | 복사 저장 삭제
+        """
         self._width_var = tk.IntVar(value=self._tool_sizes.get("pen", 3))
-
-        # 에디터 아이콘 로드 (GC 방지를 위해 인스턴스 변수에 보관)
         self._editor_icons: dict = self._load_editor_icons()
 
         bar = tk.Frame(self.root, bd=1, relief=tk.GROOVE)
@@ -293,92 +348,50 @@ class EditorWindow:
             )
 
         def ic(name):
-            """아이콘 이미지를 반환. 없으면 None (텍스트 폴백)."""
             return self._editor_icons.get(name)
 
         # ── 히스토리 그룹 ──
-        self._tb_btn(bar, "뒤로", self._undo,  icon_img=ic("뒤로"))
+        self._tb_btn(bar, "뒤로",   self._undo,  icon_img=ic("뒤로"))
         self._tb_btn(bar, "앞으로", self._redo,  icon_img=ic("앞으로"))
-        self._tb_btn(bar, "초기화",   self._reset, icon_img=ic("초기화"))
+        self._tb_btn(bar, "초기화", self._reset, icon_img=ic("초기화"))
         sep()
 
-        # ── 도구 그룹 ──
+        # ── 도형 그룹: 직선 화살표 원 사각형 (개별 버튼) ──
         self._tool_btns: dict = {}
 
+        _SHAPE_DEFS = [
+            ("직선",   "line",    "직선"),
+            ("화살표", "arrow",   "화살표"),
+            ("원",     "ellipse", "원"),
+            ("사각형", "rect",    "사각형"),
+        ]
+        for label, sub, icon_name in _SHAPE_DEFS:
+            s = sub  # capture
+            btn = self._tb_btn(bar, label,
+                               lambda s=s: self._select_shape(s),
+                               icon_img=ic(icon_name))
+            self._tool_btns[f"shape_{sub}"] = btn
+        sep()
+
+        # ── 그리기/편집 그룹: 펜 형광펜 텍스트 자르기 모자이크 테두리 ──
         def mk_tool(label: str, tool: str, icon_name: str = "") -> tk.Button:
-            """도구 버튼 생성. icon_name 아이콘 있으면 위/텍스트 아래 compound."""
             btn = self._tb_btn(bar, label, lambda t=tool: self._set_tool(t),
                                icon_img=ic(icon_name) if icon_name else None)
             self._tool_btns[tool] = btn
             return btn
 
-        mk_tool("펜",    "pen",         "펜")
+        mk_tool("펜",     "pen",         "펜")
         mk_tool("형광펜", "highlighter", "형광펜")
-
-        # ── 도형: 메인(현재 도형 텍스트, 고정 너비) + 드롭다운(도형.png + "도형선택") ──
-        shape_frame = tk.Frame(bar)
-        shape_frame.pack(side=tk.LEFT, padx=1, pady=2)
-        # 메인: 다른 icon+text 버튼과 동일한 compound=TOP 스타일, 고정 너비
-        # 현재 선택된 도형의 아이콘을 표시 (GC 방지: _editor_icons에 이미 저장됨)
-        # width=50 픽셀 고정 (이미지가 설정되면 width는 픽셀 단위로 동작)
-        _cur_shape_ic = self._editor_icons.get(self._shape_label())
-        if _cur_shape_ic is not None:
-            self._shape_main_btn = tk.Button(
-                shape_frame,
-                image=_cur_shape_ic,
-                text=self._shape_label(),
-                compound=tk.TOP,
-                width=70,   # 40px 아이콘 기준 픽셀 너비
-                relief=tk.FLAT,
-                font=("맑은 고딕", 8),
-                command=lambda: self._select_shape(self._sub_tool),
-                padx=4, pady=2,
-            )
-        else:
-            self._shape_main_btn = tk.Button(
-                shape_frame,
-                text=self._shape_label(),
-                width=5,
-                relief=tk.FLAT,
-                font=("맑은 고딕", 9),
-                command=lambda: self._select_shape(self._sub_tool),
-                padx=4, pady=2,
-            )
-        self._shape_main_btn.pack(side=tk.LEFT, padx=1, pady=2)
-        self._tool_btns["shape"] = self._shape_main_btn
-        # 드롭다운: 도형.png 아이콘 + "도형선택" 텍스트
-        _dd_ic = ic("도형")
-        if _dd_ic is not None:
-            shape_dd_btn = tk.Button(
-                shape_frame, image=_dd_ic, text="도형선택",
-                compound=tk.TOP, relief=tk.FLAT,
-                font=("맑은 고딕", 8),
-                command=self._show_shape_menu,
-                padx=4, pady=2,
-            )
-        else:
-            shape_dd_btn = tk.Button(
-                shape_frame, text="▼ 도형선택", relief=tk.FLAT,
-                font=("맑은 고딕", 9),
-                command=self._show_shape_menu,
-            )
-        shape_dd_btn.pack(side=tk.LEFT)
-        self._shape_dd_btn = shape_dd_btn
-
-        mk_tool("텍스트", "text",   "텍스트")
-        mk_tool("지우개", "eraser", "지우개")
-        sep()
-
-        # ── 편집 그룹 ──
-        mk_tool("자르기",  "crop",   "자르기")
-        mk_tool("모자이크", "mosaic", "모자이크")
+        mk_tool("텍스트", "text",        "텍스트")
+        mk_tool("자르기", "crop",        "자르기")
+        mk_tool("테두리", "border",    "테두리")
+        mk_tool("모자이크", "mosaic",    "모자이크")
         sep()
 
         # ── 복사 / 저장 / 삭제 ──
         self._tb_btn(bar, "복사", self._copy,   icon_img=ic("복사"))
         self._tb_btn(bar, "저장", self._save,   icon_img=ic("저장"))
         self._tb_btn(bar, "삭제", self._delete, icon_img=ic("삭제"))
-        sep()
 
         # 초기 도구 강조
         self._highlight_tool("pen")
@@ -417,8 +430,8 @@ class EditorWindow:
             btn = tk.Button(
                 parent, image=icon_img, text=text,
                 compound=tk.TOP, relief=tk.FLAT,
-                font=("맑은 고딕", 8),
-                command=command, padx=4, pady=2,
+                font=("맑은 고딕", 11),   # 9 → 11 (item 3-2-1: +2pt)
+                command=command, padx=4, pady=6,   # pady=4 → 6 (텍스트 위치 반칸 아래)
             )
         else:
             btn = tk.Button(
@@ -433,9 +446,18 @@ class EditorWindow:
     # 도구별 속성 바 (색상 + 두께 셀렉트 바)
     # ──────────────────────────────────────────────
 
+    # image/color.png 에서 추출한 10가지 기본 색상
     _PROP_COLORS = [
-        "#000000", "#FFFFFF", "#E74C3C", "#3498DB", "#2ECC71",
-        "#AAAAAA", "#FFFF00", "#9B59B6", "#1ABC9C", "#333333",
+        "#000000",  # 검정
+        "#820014",  # 진빨강
+        "#E31B22",  # 빨강
+        "#F47A25",  # 주황
+        "#FFF200",  # 노랑
+        "#21A949",  # 초록
+        "#00A2E8",  # 하늘색
+        "#3E47C8",  # 파랑
+        "#A048A1",  # 보라
+        "#F4F4F4",  # 흰색
     ]
     _PROP_WIDTHS_PEN = [1, 3, 5, 8, 12]        # 펜/도형/기타
     _PROP_WIDTHS_HL  = [5, 9, 13, 17, 21]     # 형광펜 (차별화)
@@ -446,23 +468,23 @@ class EditorWindow:
         bar.pack(side=tk.TOP, fill=tk.X)
         self._prop_bar = bar
 
-        # ── 색상 ──
+        # ── 색상 (원형 스워치 10개) ──
         tk.Label(bar, text="색상", font=("맑은 고딕", 9)).pack(side=tk.LEFT, padx=(6, 2))
 
         swatch_host = tk.Frame(bar)
         swatch_host.pack(side=tk.LEFT)
-        self._prop_swatch_frames: list = []
+        self._prop_swatch_canvases: list = []  # [(color, canvas, oval_id)]
+        _CS = 22  # 원 캔버스 크기 (px)
+        _CM = 2   # 원 내부 여백 (px)
         for i, col in enumerate(self._PROP_COLORS):
-            fr = tk.Frame(swatch_host, bg=col, width=20, height=20,
-                          cursor="hand2", relief=tk.RAISED, bd=1)
-            fr.grid(row=i // 5, column=i % 5, padx=1, pady=1)
-            fr.bind("<Button-1>", lambda e, c=col: self._apply_preset_color(c))
-            self._prop_swatch_frames.append((col, fr))
-
-        # 커스텀 색상 버튼 (19회차 item 8: 별도 색상 스워치 제거, 버튼만 유지)
-        self._custom_color_btn = tk.Button(bar, text="+", font=("맑은 고딕", 9),
-                                           relief=tk.FLAT, command=self._pick_color)
-        self._custom_color_btn.pack(side=tk.LEFT, padx=(4, 4))
+            cv = tk.Canvas(swatch_host, width=_CS, height=_CS,
+                           highlightthickness=0, cursor="hand2",
+                           bg=bar.cget("bg"))
+            cv.grid(row=i // 5, column=i % 5, padx=1, pady=1)  # 2행×5열
+            oid = cv.create_oval(_CM, _CM, _CS - _CM, _CS - _CM,
+                                 fill=col, outline="#888888", width=1)
+            cv.bind("<Button-1>", lambda e, c=col: self._apply_preset_color(c))
+            self._prop_swatch_canvases.append((col, cv, oid))
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=3)
 
@@ -497,6 +519,16 @@ class EditorWindow:
             cfg_save(c)
         except Exception:
             pass
+        if self._tool == "border":
+            self._refresh_canvas()
+        # 텍스트 위젯이 열려 있으면 색상 즉시 반영
+        if self._text_widget is not None:
+            try:
+                self._text_widget.configure(fg=color, insertbackground=color)
+                self._text_widget.tag_config("_style", foreground=color)
+                self._text_widget.tag_add("_style", "1.0", tk.END)
+            except Exception:
+                pass
 
     def _apply_preset_width(self, width: int) -> None:
         """셀렉트 바 두께 선택."""
@@ -511,21 +543,35 @@ class EditorWindow:
             cfg_save(cfg)
         except Exception:
             pass
+        if self._tool == "border":
+            self._refresh_canvas()
 
     def _current_widths(self) -> list:
         if self._tool == "highlighter":
             return self._PROP_WIDTHS_HL
         return self._PROP_WIDTHS_PEN
 
+    @staticmethod
+    def _hl_preview_color(color: str) -> str:
+        """형광펜 미리보기: 원색을 흰색과 50% 블렌딩하여 반투명 효과를 시뮬레이션합니다."""
+        try:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            return f"#{(r + 255) // 2:02x}{(g + 255) // 2:02x}{(b + 255) // 2:02x}"
+        except Exception:
+            return color
+
     def _update_prop_bar(self) -> None:
         """현재 색상/두께에 맞게 셀렉트 바 강조 갱신."""
-        if not hasattr(self, '_prop_swatch_frames'):
+        if not hasattr(self, '_prop_swatch_canvases'):
             return
         cur_color = self._color.lower()
-        for col, fr in self._prop_swatch_frames:
+        for col, cv, oid in self._prop_swatch_canvases:
             active = col.lower() == cur_color
-            fr.config(relief=tk.SUNKEN if active else tk.RAISED, bd=2 if active else 1)
-        # 19회차 item 8: _custom_color_frame 제거됨 — 두께 슬롯 선에 색상 반영
+            cv.itemconfig(oid,
+                          outline="#0078D4" if active else "#888888",
+                          width=2 if active else 1)
 
         if not hasattr(self, '_prop_width_slots'):
             return
@@ -623,6 +669,7 @@ class EditorWindow:
 
         # 19회차 item 3: 자르기 패널 빌드
         self._build_crop_panel()
+        self._build_border_panel()
 
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._drag)
@@ -759,6 +806,9 @@ class EditorWindow:
 
         self._refresh_canvas()
         self._update_status()
+        # 3-6 item 2: 새 이미지 로드 시 뷰포트를 가운데로 초기화
+        # (우클릭 패닝으로 이동한 위치가 다음 이미지에 남지 않도록)
+        self.root.after(10, self._reset_pan)
 
     def _get_rendered(self) -> Image.Image:
         """base_image + ops를 렌더링한 PIL Image(RGB)를 반환합니다."""
@@ -773,6 +823,10 @@ class EditorWindow:
             self.canvas.itemconfig(self._bg_item, image="")
             return
         rendered = self._get_rendered()
+        # 테두리 모드: 패널이 열려있을 때만 미리보기 씌움
+        # (적용 후 패널 닫히면 커밋된 이미지만 표시, 미리보기 중복 방지)
+        if self._tool == "border" and self._border_panel_shown:
+            rendered = self._get_border_preview(rendered)
         iw, ih = rendered.size
         new_w = max(1, int(iw * self._zoom))
         new_h = max(1, int(ih * self._zoom))
@@ -812,6 +866,8 @@ class EditorWindow:
         self._center_image(iw, ih)
         if self._tool == "crop" and self._crop_rect is not None:
             self._draw_crop_overlay()
+        if self._border_panel_shown:
+            self._show_border_panel()
 
     def _update_status(self) -> None:
         """하단 상태바를 갱신합니다."""
@@ -867,6 +923,20 @@ class EditorWindow:
             self._clear_crop_overlay()
             self._crop_rect = None
             self.canvas.config(cursor=self._tool_cursor())
+            # 화살표키 원래 바인딩 복원 (이미지 이동)
+            self.canvas.bind("<Up>",   lambda e: self._next_image() or "break")
+            self.canvas.bind("<Down>", lambda e: self._prev_image() or "break")
+            self.canvas.unbind("<Left>")
+            self.canvas.unbind("<Right>")
+            self.root.bind("<Up>",   lambda e: self._next_image())
+            self.root.bind("<Down>", lambda e: self._prev_image())
+            self.root.unbind("<Left>")
+            self.root.unbind("<Right>")
+
+        # 테두리 도구에서 다른 도구로 전환: 패널 숨기고 미리보기 제거
+        if self._tool == "border" and tool != "border":
+            self._hide_border_panel()
+            self._refresh_canvas()
 
         if self._text_widget is not None:
             self._finish_text_input()
@@ -897,6 +967,22 @@ class EditorWindow:
             iw, ih = self._base_image.size
             self._crop_rect = (0, 0, iw, ih)
             self._draw_crop_overlay()
+            # 화살표키로 W/H 조절 (엔트리 포커스 없이도 동작)
+            # 좌우 = W, 상하 = H
+            self.canvas.bind("<Left>",  lambda e: (self._crop_adjust(self._crop_var_w, -1), "break")[1])
+            self.canvas.bind("<Right>", lambda e: (self._crop_adjust(self._crop_var_w, +1), "break")[1])
+            self.canvas.bind("<Up>",    lambda e: (self._crop_adjust(self._crop_var_h, +1), "break")[1])
+            self.canvas.bind("<Down>",  lambda e: (self._crop_adjust(self._crop_var_h, -1), "break")[1])
+            self.root.bind("<Left>",  lambda e: self._crop_adjust(self._crop_var_w, -1))
+            self.root.bind("<Right>", lambda e: self._crop_adjust(self._crop_var_w, +1))
+            self.root.bind("<Up>",    lambda e: self._crop_adjust(self._crop_var_h, +1))
+            self.root.bind("<Down>",  lambda e: self._crop_adjust(self._crop_var_h, -1))
+            self.canvas.focus_set()
+
+        # 테두리 도구로 전환: 패널 표시
+        if tool == "border":
+            self._show_border_panel()
+            self._refresh_canvas()
 
         # 도구 전환 즉시 커서 갱신 (다음 motion 이벤트를 기다리지 않음)
         self.canvas.config(cursor=self._tool_cursor())
@@ -907,9 +993,12 @@ class EditorWindow:
 
     def _highlight_tool(self, tool: str) -> None:
         """현재 선택된 도구 버튼을 강조합니다.
-        드롭다운(shape_dd_btn)은 독립적이므로 강조에서 제외합니다."""
+        shape 도구는 현재 sub_tool 키(shape_rect 등)로 매칭합니다."""
         for t, btn in self._tool_btns.items():
-            active = (t == tool)
+            if tool == "shape":
+                active = (t == f"shape_{self._sub_tool}")
+            else:
+                active = (t == tool)
             btn.config(relief=tk.SUNKEN if active else tk.FLAT,
                        bg=ACTIVE_BG if active else NORMAL_BG)
 
@@ -949,15 +1038,6 @@ class EditorWindow:
     def _select_shape(self, sub: str) -> None:
         """도형 서브 툴을 선택하고 즉시 활성화합니다."""
         self._sub_tool = sub
-        if hasattr(self, '_shape_main_btn'):
-            label = self._shape_label()
-            shape_ic = self._editor_icons.get(label)
-            if shape_ic is not None:
-                self._shape_main_btn.config(
-                    image=shape_ic, text=label, compound=tk.TOP
-                )
-            else:
-                self._shape_main_btn.config(text=label)
         self._set_tool("shape")
 
     # 기본 색상 팔레트 (Excel 스타일, 10열×6행)
@@ -1219,9 +1299,8 @@ class EditorWindow:
                     self.canvas.coords(self._pen_preview_items[0], flat)
                 else:
                     item = self.canvas.create_line(
-                        flat, fill=color, width=lw,
+                        flat, fill=self._hl_preview_color(color), width=lw,
                         smooth=False, capstyle=tk.ROUND, joinstyle=tk.ROUND,
-                        stipple="gray50",
                     )
                     self._pen_preview_items.append(item)
 
@@ -1393,6 +1472,28 @@ class EditorWindow:
         # FocusOut: 자동 확정
         text_widget.bind("<FocusOut>", self._finish_text_input)
 
+        # 모든 텍스트에 일관된 폰트/색상 태그 적용
+        # (마지막 라인 스타일 불일치, 한글 조합 중 문자 스타일 불일치 방지)
+        text_widget.tag_config("_style",
+                               font=("맑은 고딕", font_size),
+                               foreground=self._color)
+
+        def _apply_text_style(event=None):
+            """이벤트 처리 완료 후 전체 텍스트에 스타일 태그를 적용합니다."""
+            def do():
+                try:
+                    text_widget.tag_add("_style", "1.0", tk.END)
+                except Exception:
+                    pass
+            text_widget.after_idle(do)
+
+        text_widget.bind("<Key>",        _apply_text_style, add="+")
+        text_widget.bind("<KeyRelease>", _apply_text_style, add="+")
+
+        # Windows IME 조합 창 폰트 동기화 — 조합 중 문자가 지정 크기/색으로 보이도록
+        text_widget.update_idletasks()
+        _sync_ime_font(text_widget.winfo_id(), "맑은 고딕", font_size)
+
     def _finish_text_input(self, event=None) -> Optional[str]:
         """텍스트 입력을 확정하고 Operation으로 커밋합니다."""
         if self._text_widget is None:
@@ -1459,7 +1560,7 @@ class EditorWindow:
             self._ops, self._redo_stack = self._reset_stack.pop()
             self._refresh_canvas()
         elif self._base_image_stack:
-            # 자르기 롤백 — redo를 위해 현재 base 저장
+            # 자르기/테두리 롤백 — redo를 위해 현재 base 저장
             self._base_image_redo_stack.append(self._base_image.copy())
             self._base_image = self._base_image_stack.pop()
             self._ops = []
@@ -1488,7 +1589,7 @@ class EditorWindow:
                 self.load_image(del_idx)
                 self._flash(f"삭제 취소: 이미지 #{del_idx + 1} 복원")
             except Exception as e:
-                print(f"삭제 undo 오류: {e}")
+                pass
 
     def _redo(self) -> None:
         if self._redo_stack:
@@ -1554,8 +1655,12 @@ class EditorWindow:
     # ──────────────────────────────────────────────
 
     def _get_final_image(self) -> Image.Image:
-        """최종 이미지를 반환합니다 (항상 원본 품질 PNG)."""
-        return self._get_rendered()
+        """최종 이미지를 반환합니다.
+        border 모드 + 패널 표시 중이면 미리보기 테두리 포함 (복사/저장 시 테두리 반영)."""
+        rendered = self._get_rendered()
+        if self._tool == "border" and self._border_panel_shown:
+            rendered = self._get_border_preview(rendered)
+        return rendered
 
     def _save(self) -> None:
         img = self._get_final_image()
@@ -1600,12 +1705,13 @@ class EditorWindow:
     # ──────────────────────────────────────────────
 
     def _on_escape(self) -> None:
-        """ESC: 자르기 선택 초기화 / 텍스트 취소 / 창 닫기."""
+        """ESC: 자르기 선택 초기화 / 텍스트 취소 / 테두리 취소 / 창 닫기."""
         if self._tool == "crop" and self._crop_rect is not None and self._base_image is not None:
-            # 자르기 영역을 전체 이미지로 초기화
             iw, ih = self._base_image.size
             self._crop_rect = (0, 0, iw, ih)
             self._draw_crop_overlay()
+        elif self._tool == "border":
+            self._set_tool("pen")
         elif self._text_widget is not None:
             self._cancel_text_input()
         else:
@@ -1646,11 +1752,10 @@ class EditorWindow:
         self._hide_all_cursor_items()
 
     def _tool_cursor(self) -> str:
-        """현재 도구에 맞는 OS 커서를 반환합니다.
-        text·mosaic·shape → 십자가, pen·hl·eraser·crop → 기본 화살표."""
+        """현재 도구에 맞는 OS 커서를 반환합니다."""
         if self._tool in ("text", "mosaic", "shape"):
             return "crosshair"
-        return ""  # pen·hl·eraser·crop·기타 → 기본 화살표
+        return ""  # pen·hl·eraser·crop·border·기타 → 기본 화살표
 
     # ──────────────────────────────────────────────
     # 19회차 item 3: 자르기 패널 (W/H 입력)
@@ -1671,13 +1776,42 @@ class EditorWindow:
         entry_s = {"width": 5, "font": ("맑은 고딕", 9),
                    "bg": "#3a3a3a", "fg": "white",
                    "insertbackground": "white", "relief": tk.FLAT}
+        spin_s  = {"bg": "#555555", "fg": "white", "relief": tk.FLAT,
+                   "font": ("맑은 고딕", 7), "width": 2, "takefocus": 0,
+                   "pady": 0, "padx": 0}
 
+        def _make_spin(parent, var):
+            """▲/▼ 버튼 쌍을 담은 Frame 반환 (takefocus=0으로 Entry 포커스 유지)."""
+            sf = tk.Frame(parent, bg="#2b2b2b")
+            tk.Button(sf, text="▲",
+                      command=lambda: self._crop_adjust(var, +1),
+                      **spin_s).pack(side=tk.TOP, fill=tk.X)
+            tk.Button(sf, text="▼",
+                      command=lambda: self._crop_adjust(var, -1),
+                      **spin_s).pack(side=tk.TOP, fill=tk.X)
+            return sf
+
+        # W 입력 + ▲▼
         tk.Label(inner, text="W:", **label_s).pack(side=tk.LEFT)
-        tk.Entry(inner, textvariable=self._crop_var_w, **entry_s).pack(
-            side=tk.LEFT, padx=(2, 6))
+        w_entry = tk.Entry(inner, textvariable=self._crop_var_w, **entry_s)
+        w_entry.pack(side=tk.LEFT, padx=(2, 0))
+        _make_spin(inner, self._crop_var_w).pack(side=tk.LEFT, padx=(0, 8))
+        # 방향키 바인딩: 포커스 위치 무관하게 좌우=W, 상하=H
+        def _bind_crop_keys(widget):
+            widget.bind("<Right>", lambda e: (self._crop_adjust(self._crop_var_w, +1), "break")[1])
+            widget.bind("<Left>",  lambda e: (self._crop_adjust(self._crop_var_w, -1), "break")[1])
+            widget.bind("<Up>",    lambda e: (self._crop_adjust(self._crop_var_h, +1), "break")[1])
+            widget.bind("<Down>",  lambda e: (self._crop_adjust(self._crop_var_h, -1), "break")[1])
+
+        _bind_crop_keys(w_entry)
+
+        # H 입력 + ▲▼
         tk.Label(inner, text="H:", **label_s).pack(side=tk.LEFT)
-        tk.Entry(inner, textvariable=self._crop_var_h, **entry_s).pack(
-            side=tk.LEFT, padx=(2, 6))
+        h_entry = tk.Entry(inner, textvariable=self._crop_var_h, **entry_s)
+        h_entry.pack(side=tk.LEFT, padx=(2, 0))
+        _make_spin(inner, self._crop_var_h).pack(side=tk.LEFT, padx=(0, 8))
+        _bind_crop_keys(h_entry)
+
         tk.Button(inner, text="자르기", bg="#0078D4", fg="white",
                   font=("맑은 고딕", 9, "bold"), relief=tk.FLAT, padx=6,
                   command=self._confirm_crop).pack(side=tk.LEFT)
@@ -1688,8 +1822,25 @@ class EditorWindow:
         self._crop_panel_id = self.canvas.create_window(
             0, 0, window=panel, anchor=tk.NW, state=tk.HIDDEN)
 
+    def _crop_adjust(self, var: tk.IntVar, delta: int) -> None:
+        """자르기 W/H 값을 delta만큼 증감합니다 (이미지 크기 상한 적용)."""
+        try:
+            new_val = max(10, var.get() + delta)
+            # 상한선: 이미지 범위를 넘지 않도록 제한
+            if self._base_image is not None and self._crop_rect is not None:
+                iw, ih = self._base_image.size
+                x0, y0 = int(self._crop_rect[0]), int(self._crop_rect[1])
+                if var is self._crop_var_w:
+                    new_val = min(new_val, iw - x0)
+                elif var is self._crop_var_h:
+                    new_val = min(new_val, ih - y0)
+            var.set(new_val)
+        except Exception:
+            pass
+
     def _on_crop_panel_change(self, *args) -> None:
-        """패널 W/H 입력 시 crop_rect 갱신."""
+        """패널 W/H 입력 시 crop_rect 갱신.
+        _crop_editing 플래그 동안 _update_crop_panel 이 Entry 를 덮어쓰지 않도록 보호."""
         if self._crop_panel_syncing or self._crop_rect is None or self._base_image is None:
             return
         try:
@@ -1697,17 +1848,22 @@ class EditorWindow:
             h = self._crop_var_h.get()
         except (ValueError, tk.TclError):
             return
-        w = max(10, w)
-        h = max(10, h)
         iw, ih = self._base_image.size
         x0, y0, _, _ = self._crop_rect
-        x1 = min(x0 + w, iw)
-        y1 = min(y0 + h, ih)
+        w = max(10, min(w, iw - int(x0)))
+        h = max(10, min(h, ih - int(y0)))
+        x1 = x0 + w
+        y1 = y0 + h
         self._crop_rect = (x0, y0, x1, y1)
-        self._draw_crop_overlay()
+        self._crop_editing = True   # Entry 덮어쓰기 차단 시작
+        try:
+            self._draw_crop_overlay()
+        finally:
+            self._crop_editing = False
 
     def _update_crop_panel(self) -> None:
-        """crop_rect 변경 시 패널 값과 위치를 갱신합니다."""
+        """crop_rect 변경 시 패널 값과 위치를 갱신합니다.
+        _crop_editing 중(사용자 입력 중)에는 Entry 값을 덮어쓰지 않습니다."""
         if self._crop_panel_id is None:
             return
         if self._crop_rect is None or self._base_image is None:
@@ -1717,14 +1873,16 @@ class EditorWindow:
         w = max(1, int(round(x1 - x0)))
         h = max(1, int(round(y1 - y0)))
 
-        self._crop_panel_syncing = True
-        try:
-            self._crop_var_w.set(w)
-            self._crop_var_h.set(h)
-        finally:
-            self._crop_panel_syncing = False
+        # 사용자가 직접 입력 중이 아닐 때만 Entry 값 갱신
+        if not getattr(self, "_crop_editing", False):
+            self._crop_panel_syncing = True
+            try:
+                self._crop_var_w.set(w)
+                self._crop_var_h.set(h)
+            finally:
+                self._crop_panel_syncing = False
 
-        # 패널 위치: 자르기 영역 우측 하단
+        # 패널 위치: 자르기 영역 우측 하단 (항상 갱신)
         zoom = self._zoom
         ox, oy = self._img_x, self._img_y
         px = int(x1 * zoom) + ox
@@ -1735,6 +1893,79 @@ class EditorWindow:
         self.canvas.coords(self._crop_panel_id, px - pw, py)
         self.canvas.itemconfig(self._crop_panel_id, state=tk.NORMAL)
         self.canvas.tag_raise(self._crop_panel_id)
+
+    # ──────────────────────────────────────────────
+    # 테두리 기능
+    # - border 모드: _base_image 건드리지 않고 렌더 시점에 미리보기
+    # - [적용] 버튼: 그때 _base_image 에 커밋 (undo 가능)
+    # - 복사/저장: border 모드이면 미리보기 포함
+    # ──────────────────────────────────────────────
+
+    def _get_border_preview(self, img: Image.Image) -> Image.Image:
+        """현재 색상·두께로 테두리를 씌운 이미지를 반환합니다 (원본 불변)."""
+        try:
+            thickness = max(1, self._width_var.get())
+        except Exception:
+            thickness = 2
+        col = self._color.lstrip("#")
+        fill_rgb = tuple(int(col[i:i+2], 16) for i in (0, 2, 4))
+        from PIL import ImageOps
+        return ImageOps.expand(img.convert("RGB"), border=thickness,
+                               fill=fill_rgb).convert("RGBA")
+
+    def _build_border_panel(self) -> None:
+        """자르기 패널과 동일한 방식의 하단 [테두리 적용] 패널 (초기 숨김)."""
+        panel = tk.Frame(self.canvas, bg="#2b2b2b", padx=6, pady=4,
+                         relief=tk.RAISED, bd=1)
+        self._border_panel = panel
+        inner = tk.Frame(panel, bg="#2b2b2b")
+        inner.pack()
+        tk.Button(inner, text="테두리 적용", bg="#0078D4", fg="white",
+                  font=("맑은 고딕", 9, "bold"), relief=tk.FLAT, padx=10,
+                  command=self._apply_border_commit).pack(side=tk.LEFT)
+        self._border_panel_id = self.canvas.create_window(
+            0, 0, window=panel, anchor=tk.NW, state=tk.HIDDEN)
+
+    def _show_border_panel(self) -> None:
+        if self._border_panel_id is None:
+            return
+        self._border_panel_shown = True
+        self.canvas.update_idletasks()
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        self._border_panel.update_idletasks()
+        pw = self._border_panel.winfo_reqwidth() or 300
+        ph = self._border_panel.winfo_reqheight() or 30
+        px = max(0, (cw - pw) // 2)
+        py = max(0, ch - ph - 10)
+        self.canvas.coords(self._border_panel_id, px, py)
+        self.canvas.itemconfig(self._border_panel_id, state=tk.NORMAL)
+        self.canvas.tag_raise(self._border_panel_id)
+
+    def _hide_border_panel(self) -> None:
+        self._border_panel_shown = False
+        if self._border_panel_id is not None:
+            self.canvas.itemconfig(self._border_panel_id, state=tk.HIDDEN)
+
+    def _apply_border_commit(self) -> None:
+        """[테두리 적용] 버튼: 현재 미리보기 테두리를 _base_image 에 커밋합니다.
+        테두리 모드는 유지하되 패널만 닫습니다.
+        다시 테두리 버튼을 누르면 패널이 다시 열립니다."""
+        if self._base_image is None:
+            return
+        rendered = self._get_rendered()
+        new_img = self._get_border_preview(rendered)
+        # undo 스택에 현재 base 저장
+        self._base_image_stack.append(self._base_image.copy())
+        self._base_image_redo_stack.clear()
+        self._ops = []
+        self._redo_stack = []
+        self._base_image = new_img
+        # 패널만 숨김 (테두리 모드 유지)
+        # _border_panel_shown = False → _refresh_canvas가 미리보기 없이 렌더링
+        self._hide_border_panel()
+        self._refresh_canvas()
+        self._update_status()
 
     # ──────────────────────────────────────────────
     # 19회차 item 7: 도구 크기/색상 인디케이터

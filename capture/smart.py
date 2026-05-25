@@ -17,8 +17,11 @@ class SmartCapture:
     OUTLINE_WIDTH = 3
     DIM_FACTOR = 0.55
 
-    def __init__(self, master=None):
+    def __init__(self, master=None, on_drag_start=None, on_overlay_ready=None):
         self.master = master
+        self._on_drag_start = on_drag_start
+        self._on_overlay_ready = on_overlay_ready
+        self._kb_esc_hook = None
         self.screenshot: Image.Image | None = None
         self.dimmed_tk: ImageTk.PhotoImage | None = None
         self.regions: list = []
@@ -67,9 +70,21 @@ class SmartCapture:
             fill="",
         )
 
+        # 오버레이 생성 완료 → 50ms 후 콜백 (툴바를 오버레이 위로 lift)
+        if self._on_overlay_ready:
+            root.after(50, self._on_overlay_ready)
+
         canvas.bind("<Motion>", self._on_move)
         canvas.bind("<Button-1>", self._on_click)
         root.bind("<Escape>", lambda e: self._cancel())
+
+        # 3-2 item 7: keyboard 레벨 ESC 훅 (포커스 미확보 시 보완)
+        try:
+            import keyboard as _kb
+            self._kb_esc_hook = _kb.add_hotkey(
+                'esc', lambda: root.after(0, self._cancel), suppress=False)
+        except Exception:
+            pass
 
         if self.master:
             self.master.wait_window(root)
@@ -100,14 +115,32 @@ class SmartCapture:
         self.canvas.itemconfig(self._region_item, image=tk_crop)
         self.canvas.coords(self._rect_item, x1, y1, x2, y2)
 
+    def _remove_kb_hook(self) -> None:
+        """keyboard ESC 훅을 안전하게 제거합니다."""
+        if self._kb_esc_hook is not None:
+            try:
+                import keyboard as _kb
+                _kb.remove_hotkey(self._kb_esc_hook)
+            except Exception:
+                pass
+            self._kb_esc_hook = None
+
     def _on_click(self, event: tk.Event) -> None:
+        # 3-2 item 2: 클릭 시 툴바 숨기기
+        if self._on_drag_start:
+            try:
+                self._on_drag_start()
+            except Exception:
+                pass
+        self._remove_kb_hook()
         if self.current_region:
             x1, y1, x2, y2 = self.current_region
             self.captured_image = self.screenshot.crop((x1, y1, x2, y2))
         self.root.destroy()
 
     def _cancel(self) -> None:
-        """캡처를 취소합니다 (20회차 item 4: 모드 전환 지원)."""
+        """캡처를 취소합니다."""
+        self._remove_kb_hook()
         self.captured_image = None
         if self.root:
             try:

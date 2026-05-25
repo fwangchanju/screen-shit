@@ -103,6 +103,12 @@ class HistoryPanel:
         canvas.bind("<MouseWheel>", self._on_mousewheel)
         inner.bind("<MouseWheel>", self._on_mousewheel)
 
+        # 방향키 네비게이션 (캔버스에 포커스 가능하도록 설정)
+        canvas.config(takefocus=True)
+        canvas.bind("<Up>",   self._on_key_up)
+        canvas.bind("<Down>", self._on_key_down)
+        canvas.bind("<Button-1>", lambda e: canvas.focus_set(), add="+")
+
         self._item_frames: List[tk.Frame] = []
         self._populate()
 
@@ -119,8 +125,27 @@ class HistoryPanel:
             self._thumb_w = max(_MIN_THUMB, min(_MAX_THUMB, self._thumb_w + delta))
             self._thumb_h = int(self._thumb_w * 0.75)
             self._populate()
-        else:
-            self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        # 일반 휠은 무시 — 방향키로만 탐색
+
+    def _on_key_up(self, event) -> None:
+        """위쪽 화살표: 목록 위쪽(더 최신) 캡처로 이동."""
+        n = len(self._history)
+        if n == 0:
+            return
+        if self._selected_idx is None:
+            self._on_click(n - 1)
+        elif self._selected_idx < n - 1:
+            self._on_click(self._selected_idx + 1)
+
+    def _on_key_down(self, event) -> None:
+        """아래쪽 화살표: 목록 아래쪽(더 오래된) 캡처로 이동."""
+        n = len(self._history)
+        if n == 0:
+            return
+        if self._selected_idx is None:
+            self._on_click(n - 1)
+        elif self._selected_idx > 0:
+            self._on_click(self._selected_idx - 1)
 
     # ──────────────────────────────────────────────
     # 썸네일 생성
@@ -192,11 +217,11 @@ class HistoryPanel:
         row.pack(fill=tk.X, padx=4, pady=(2, 5))
         tk.Label(row, text=f"#{orig_idx + 1}", bg=item_bg,
                  fg=SEL_TEXT if is_selected else TEXT_COLOR,
-                 font=("맑은 고딕", 8)).pack(side=tk.LEFT)
+                 font=("맑은 고딕", 11)).pack(side=tk.LEFT)
         if size_text:
             tk.Label(row, text=size_text, bg=item_bg,
                      fg=SEL_TEXT if is_selected else "#888888",
-                     font=("맑은 고딕", 7)).pack(side=tk.RIGHT)
+                     font=("맑은 고딕", 11)).pack(side=tk.RIGHT)
 
         def _set_bg(w, color):
             try:
